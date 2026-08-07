@@ -149,6 +149,14 @@ impl<'d> RingBufferedUartRx<'d> {
         // Clear the buffer so that it is ready to receive data
         compiler_fence(Ordering::SeqCst);
         self.ring_buf.start();
+        // `start()` hardware-resets the DMA channel (write position back to the
+        // buffer start) but leaves the software ring indices at their pre-error
+        // values. `DmaIndex::dma_sync`'s wrap guard then clamps the write index
+        // to end-of-ring, and every read returns 0 bytes until a FULL ring of
+        // new traffic wraps past it — with sparse polled protocols that is
+        // effectively forever. Reset the software indices to match the
+        // freshly-reset DMA.
+        self.ring_buf.clear();
 
         let r = self.info.regs;
         // clear all interrupts and DMA Rx Request
