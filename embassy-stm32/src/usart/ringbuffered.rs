@@ -176,6 +176,25 @@ impl<'d> RingBufferedUartRx<'d> {
         });
     }
 
+    /// Hard-reset the receive path: stop the DMA, discard everything buffered
+    /// (hardware ring position and software indices), clear every latched
+    /// error/idle flag, and restart reception from a clean slate.
+    ///
+    /// Needed when the receiver must be *proactively* cleaned rather than
+    /// waiting for a read to observe an error — e.g. at session start against
+    /// a device that was powered off while the receiver kept running: its
+    /// dead TX holds the line low, which the USART receives as a continuous
+    /// break (a 0x00 + framing-error flood into the ring). Note that calling
+    /// `start_uart()` on a live channel is not a reliable reset — the channel
+    /// must be stopped before it is reconfigured.
+    pub fn reset_rx(&mut self) {
+        self.stop_uart();
+        let r = self.info.regs;
+        let sr_val = sr(r).read();
+        clear_interrupt_flags(r, sr_val);
+        self.start_uart();
+    }
+
     /// Stop DMA backed UART receiver
     fn stop_uart(&mut self) {
         self.ring_buf.request_pause();
