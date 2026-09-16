@@ -42,6 +42,17 @@ pub fn lse_start_failed() -> bool {
     LSE_START_FAILED.load(Ordering::Relaxed)
 }
 
+/// The clock source the RTC is currently driven by, read back from RTCSEL.
+///
+/// This is the effective source, which can differ from the one requested in
+/// [`LsConfig`]: the LSE may have failed to start (see [`lse_start_failed`]),
+/// or on parts whose backup domain is not reset by `init` (H5) the selection
+/// made at the last power-on is still in force.
+#[cfg(not(any(stm32n6, rcc_n6)))]
+pub fn rtc_clock_source() -> RtcClockSource {
+    bdcr().read().rtcsel()
+}
+
 /// Poll `ready` until it returns `true` or the LSE startup bound elapses.
 #[cfg(not(stm32n6))]
 fn wait_lse_ready(ready: impl Fn() -> bool) -> bool {
