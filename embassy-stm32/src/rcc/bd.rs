@@ -1,5 +1,5 @@
 #[cfg(not(stm32n6))]
-use core::sync::atomic::{Ordering, compiler_fence};
+use core::sync::atomic::{AtomicBool, Ordering, compiler_fence};
 
 #[cfg(not(stm32n6))]
 use crate::pac::common::{RW, Reg};
@@ -12,6 +12,72 @@ use crate::time::Hertz;
 pub const LSI_FREQ: Hertz = Hertz(40_000);
 #[cfg(not(any(stm32f0, stm32f1, stm32f3)))]
 pub const LSI_FREQ: Hertz = Hertz(32_000);
+
+/// Set when the LSE oscillator was requested but did not report `LSERDY`
+/// within [`LSE_STARTUP_TIMEOUT_POLLS`] × [`LSE_STARTUP_POLL_CYCLES`] core
+/// cycles during [`LsConfig::init`]. In that case the LSE is switched back
+/// off and, if it was the requested RTC source, the RTC is clocked from the
+/// LSI instead so that boot can proceed. Read it with [`lse_start_failed`].
+#[cfg(not(stm32n6))]
+static LSE_START_FAILED: AtomicBool = AtomicBool::new(false);
+
+/// Core cycles spent in `cortex_m::asm::delay` between two `LSERDY` polls.
+#[cfg(not(stm32n6))]
+const LSE_STARTUP_POLL_CYCLES: u32 = 1_000;
+
+/// Number of `LSERDY` polls before giving up on the LSE. With
+/// [`LSE_STARTUP_POLL_CYCLES`] this is ~192 M core cycles: ≈3 s on a 64 MHz
+/// HSI, which is the system clock while `LsConfig::init` runs on most
+/// families (the PLL is switched in afterwards). A 32.768 kHz crystal needs
+/// 0.5–2 s to start; a crystal that is still silent after this bound is
+/// missing, broken or badly loaded. This is a *bound* on the stall, not a
+/// calibrated duration — on a slower core clock it simply waits longer.
+#[cfg(not(stm32n6))]
+const LSE_STARTUP_TIMEOUT_POLLS: u32 = 192_000;
+
+/// Returns `true` if the LSE was requested in [`LsConfig`] but failed to start
+/// during [`LsConfig::init`], so the RTC is running on the LSI fallback.
+#[cfg(not(stm32n6))]
+pub fn lse_start_failed() -> bool {
+    LSE_START_FAILED.load(Ordering::Relaxed)
+}
+
+/// Poll `ready` until it returns `true` or the LSE startup bound elapses.
+#[cfg(not(stm32n6))]
+fn wait_lse_ready(ready: impl Fn() -> bool) -> bool {
+    for _ in 0..LSE_STARTUP_TIMEOUT_POLLS {
+        if ready() {
+            return true;
+        }
+        cortex_m::asm::delay(LSE_STARTUP_POLL_CYCLES);
+    }
+    ready()
+}
+
+/// Switch the LSI on and wait for it to be ready. The LSI is an internal RC
+/// oscillator: it always starts, so this wait is unbounded like the rest of
+/// the RCC bring-up.
+#[cfg(not(stm32n6))]
+fn enable_lsi() {
+    #[cfg(any(stm32u5, stm32h5, stm32wba))]
+    let csr = crate::pac::RCC.bdcr();
+    #[cfg(not(any(stm32u5, stm32h5, stm32wba, stm32c0)))]
+    let csr = crate::pac::RCC.csr();
+    #[cfg(stm32c0)]
+    let csr = crate::pac::RCC.csr2();
+
+    #[cfg(not(any(rcc_wb, rcc_wba)))]
+    csr.modify(|w| w.set_lsion(true));
+
+    #[cfg(any(rcc_wb, rcc_wba))]
+    csr.modify(|w| w.set_lsi1on(true));
+
+    #[cfg(not(any(rcc_wb, rcc_wba)))]
+    while !csr.read().lsirdy() {}
+
+    #[cfg(any(rcc_wb, rcc_wba))]
+    while !csr.read().lsi1rdy() {}
+}
 
 #[allow(dead_code)]
 #[derive(Clone, Copy)]
@@ -167,7 +233,9 @@ impl LsConfig {
             _ => todo!(),
         };
 
-        let (lse_en, lse_byp, lse_drv) = match &self.lse {
+        // Both may be downgraded below if the LSE fails to start.
+        #[allow(unused_mut)]
+        let (mut lse_en, lse_byp, lse_drv) = match &self.lse {
             Some(c) => match c.mode {
                 LseMode::Oscillator(lse_drv) => (true, false, Some(lse_drv)),
                 LseMode::Bypass => (true, true, None),
@@ -185,33 +253,14 @@ impl LsConfig {
 
         _ = lse_drv; // not all chips have it.
 
+        #[allow(unused_mut)]
+        let mut rtc = self.rtc;
+
         // Disable backup domain write protection
         unlock();
 
         if self.lsi {
-            #[cfg(any(stm32u5, stm32h5, stm32wba))]
-            let csr = crate::pac::RCC.bdcr();
-            #[cfg(stm32n6)]
-            let csr = crate::pac::RCC.sr();
-            #[cfg(not(any(stm32u5, stm32h5, stm32wba, stm32c0, stm32n6)))]
-            let csr = crate::pac::RCC.csr();
-            #[cfg(stm32c0)]
-            let csr = crate::pac::RCC.csr2();
-
-            #[cfg(not(any(rcc_wb, rcc_wba, rcc_n6)))]
-            csr.modify(|w| w.set_lsion(true));
-
-            #[cfg(rcc_n6)]
-            crate::pac::RCC.cr().modify(|w| w.set_lsion(true));
-
-            #[cfg(any(rcc_wb, rcc_wba))]
-            csr.modify(|w| w.set_lsi1on(true));
-
-            #[cfg(not(any(rcc_wb, rcc_wba)))]
-            while !csr.read().lsirdy() {}
-
-            #[cfg(any(rcc_wb, rcc_wba))]
-            while !csr.read().lsi1rdy() {}
+            enable_lsi();
         }
 
         // Enable backup regulator for peristent battery backed sram
@@ -345,7 +394,20 @@ impl LsConfig {
                     w.set_lseon(true);
                 });
 
-                while !bdcr().read().lserdy() {}
+                if !wait_lse_ready(|| bdcr().read().lserdy()) {
+                    // The crystal never came up. Do not hang the boot on it:
+                    // switch the oscillator back off, remember the failure and
+                    // keep the RTC alive on the LSI if it was meant to use the LSE.
+                    bdcr().modify(|w| w.set_lseon(false));
+                    LSE_START_FAILED.store(true, Ordering::Relaxed);
+                    lse_en = false;
+                    if rtc == RtcClockSource::LSE {
+                        if !self.lsi {
+                            enable_lsi();
+                        }
+                        rtc = RtcClockSource::LSI;
+                    }
+                }
             }
             #[cfg(rcc_n6)]
             {
@@ -360,8 +422,9 @@ impl LsConfig {
                 while !crate::pac::RCC.sr().read().lserdy() {}
             }
 
+            // Skipped when the LSE failed to start above: LSESYSRDY would never come.
             #[cfg(any(rcc_l5, rcc_u5, rcc_wle, rcc_wl5, rcc_wba, rcc_u0))]
-            if let Some(lse_sysen) = lse_sysen {
+            if lse_en && let Some(lse_sysen) = lse_sysen {
                 bdcr().modify(|w| {
                     w.set_lsesysen(lse_sysen);
                 });
@@ -370,9 +433,11 @@ impl LsConfig {
                     while !bdcr().read().lsesysrdy() {}
                 }
             }
+            // Families without LSESYSEN never read the downgraded flag.
+            let _ = lse_en;
         }
 
-        if self.rtc != RtcClockSource::DISABLE {
+        if rtc != RtcClockSource::DISABLE {
             #[cfg(not(rcc_n6))]
             bdcr().modify(|w| {
                 #[cfg(any(rtc_v2_h7, rtc_v2_l4, rtc_v2_wb, rtc_v3_base, rtc_v3_u5))]
@@ -380,12 +445,12 @@ impl LsConfig {
 
                 #[cfg(not(rcc_wba))]
                 w.set_rtcen(true);
-                w.set_rtcsel(self.rtc);
+                w.set_rtcsel(rtc);
             });
 
             #[cfg(rcc_n6)]
             {
-                crate::pac::RCC.ccipr7().modify(|w| w.set_rtcsel(self.rtc));
+                crate::pac::RCC.ccipr7().modify(|w| w.set_rtcsel(rtc));
                 crate::pac::RCC.apb4lenr().modify(|w| w.set_rtcen(true))
             }
         }
@@ -393,6 +458,20 @@ impl LsConfig {
         trace!("BDCR configured: {:08x}", bdcr().read().0);
 
         compiler_fence(Ordering::SeqCst);
+
+        // Report the source the RTC is *actually* clocked from, not the one
+        // that was requested: the LSE may have been downgraded to the LSI
+        // above, and on parts where the backup domain is not reset (H5, see
+        // the errata note) RTCSEL is write-once until the next power-on, so
+        // the write above may have been ignored. Handing the wrong frequency
+        // to the RTC driver would silently mis-program its prescalers.
+        #[cfg(not(rcc_n6))]
+        let rtc_clk = match bdcr().read().rtcsel() {
+            RtcClockSource::LSE => self.lse.as_ref().map(|c| c.frequency),
+            RtcClockSource::LSI => Some(LSI_FREQ),
+            RtcClockSource::DISABLE => None,
+            _ => rtc_clk,
+        };
 
         rtc_clk
     }
