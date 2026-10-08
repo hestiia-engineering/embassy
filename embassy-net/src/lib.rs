@@ -82,6 +82,11 @@ const DHCP_PARAMETER_REQUEST_LIST: &[u8] = &[1, 3, 6, 42];
 /// DHCP option 42: NTP servers.
 #[cfg(feature = "dhcpv4-ntp")]
 const DHCP_OPT_NTP_SERVERS: u8 = 42;
+/// DHCP option 53: message type, and its ACK value.
+#[cfg(feature = "dhcpv4-ntp")]
+const DHCP_OPT_MESSAGE_TYPE: u8 = 53;
+#[cfg(feature = "dhcpv4-ntp")]
+const DHCP_MESSAGE_ACK: u8 = 5;
 /// Maximum number of NTP servers kept from a DHCP lease.
 #[cfg(feature = "dhcpv4-ntp")]
 pub const MAX_DHCP_NTP_SERVERS: usize = 2;
@@ -429,7 +434,12 @@ fn dhcp_ntp_servers(
     address: Ipv4Address,
 ) -> Vec<Ipv4Address, MAX_DHCP_NTP_SERVERS> {
     let mut servers = Vec::new();
-    if packet.your_ip() != address {
+    // The socket copies every message carrying our transaction id; only the ACK that
+    // leased `address` describes the lease.
+    let is_ack = packet
+        .options()
+        .any(|o| o.kind == DHCP_OPT_MESSAGE_TYPE && o.data == [DHCP_MESSAGE_ACK]);
+    if !is_ack || packet.your_ip() != address {
         return servers;
     }
     for option in packet.options().filter(|o| o.kind == DHCP_OPT_NTP_SERVERS) {
@@ -442,6 +452,20 @@ fn dhcp_ntp_servers(
         }
     }
     servers
+}
+
+/// Zero the DHCP socket's copy of the last message, so a shorter message copied later
+/// never leaves this one's bytes after its end.
+#[cfg(feature = "dhcpv4-ntp")]
+fn clear_dhcp_packet(socket: &mut dhcpv4::Socket<'static>, buffer: *mut [u8; DHCP_PACKET_LEN]) {
+    // Take the socket's reference to the buffer away first, so the buffer is only
+    // written through one reference at a time, then hand it a fresh one.
+    socket.set_receive_packet_buffer(&mut []);
+    // safety: the buffer lives in the stack resources for as long as the stack exists,
+    // and the socket no longer holds a reference to it.
+    let packet: &'static mut [u8; DHCP_PACKET_LEN] = unsafe { &mut *buffer };
+    packet.fill(0);
+    socket.set_receive_packet_buffer(packet);
 }
 
 fn to_smoltcp_hardware_address(addr: driver::HardwareAddress) -> (HardwareAddress, Medium) {
@@ -990,12 +1014,22 @@ impl Inner {
                                     .map(|p| dhcp_ntp_servers(p, config.address.address()))
                                     .unwrap_or_default();
                             }
-                            self.static_v4 = Some(StaticConfigV4 {
+                            let new = StaticConfigV4 {
                                 address: config.address,
                                 gateway: config.router,
                                 dns_servers: config.dns_servers,
-                            });
-                            true
+                            };
+                            #[cfg(feature = "dhcpv4-ntp")]
+                            {
+                                // With a receive buffer smoltcp reports every renewal ACK;
+                                // the copy has been read, so clear it for the next message.
+                                clear_dhcp_packet(socket, self.dhcp_packet);
+                            }
+                            // Re-apply addresses, routes and DNS only when they changed, as
+                            // without a receive buffer (a re-apply also flushes the ARP cache).
+                            let changed = self.static_v4.as_ref() != Some(&new);
+                            self.static_v4 = Some(new);
+                            changed
                         }
                     }
                 } else if old_link_up {
@@ -1107,7 +1141,22 @@ mod dhcp_ntp_tests {
     #[test]
     fn a_message_for_another_address_yields_nothing() {
         // A stale copy: the socket keeps the previous message when a longer one does not fit.
-        let buf = message([10, 0, 0, 9], &[42, 4, 172, 24, 42, 1, 255]);
+        let buf = message([10, 0, 0, 9], &[53, 1, 5, 42, 4, 172, 24, 42, 1, 255]);
+        assert!(servers(&buf, LEASED).is_empty());
+    }
+
+    #[test]
+    fn an_offer_copied_after_the_ack_yields_nothing() {
+        // 53 = message type, 2 = OFFER: the socket copies any message with our transaction id.
+        let buf = message(LEASED, &[53, 1, 2, 42, 4, 172, 24, 42, 1, 255]);
+        assert!(servers(&buf, LEASED).is_empty());
+    }
+
+    #[test]
+    fn bytes_after_the_end_option_are_not_read() {
+        // A shorter ACK copied over a longer message: the older message's option 42 sits
+        // after this one's end option (255).
+        let buf = message(LEASED, &[53, 1, 5, 255, 42, 4, 10, 0, 0, 1, 255]);
         assert!(servers(&buf, LEASED).is_empty());
     }
 
@@ -1117,7 +1166,7 @@ mod dhcp_ntp_tests {
         let buf = message(
             LEASED,
             &[
-                42, 20, 0, 0, 0, 0, 224, 0, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 255,
+                53, 1, 5, 42, 20, 0, 0, 0, 0, 224, 0, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 255,
             ],
         );
         let got = servers(&buf, LEASED);
