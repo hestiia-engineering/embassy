@@ -70,6 +70,21 @@ const LOCAL_PORT_MAX: u16 = 65535;
 const MAX_QUERIES: usize = 4;
 #[cfg(feature = "dhcpv4-hostname")]
 const MAX_HOSTNAME_LEN: usize = 32;
+/// Size of the copy of the last DHCP message kept to read option 42 from.
+/// RFC 2131 guarantees 576-byte messages; a longer one is not copied and
+/// yields no NTP servers.
+#[cfg(feature = "dhcpv4-ntp")]
+const DHCP_PACKET_LEN: usize = 576;
+/// Parameters requested from the DHCP server: subnet mask, router, DNS
+/// servers (smoltcp's default list) and NTP servers.
+#[cfg(feature = "dhcpv4-ntp")]
+const DHCP_PARAMETER_REQUEST_LIST: &[u8] = &[1, 3, 6, 42];
+/// DHCP option 42: NTP servers.
+#[cfg(feature = "dhcpv4-ntp")]
+const DHCP_OPT_NTP_SERVERS: u8 = 42;
+/// Maximum number of NTP servers kept from a DHCP lease.
+#[cfg(feature = "dhcpv4-ntp")]
+pub const MAX_DHCP_NTP_SERVERS: usize = 2;
 
 /// Memory resources needed for a network stack.
 pub struct StackResources<const SOCK: usize> {
@@ -79,6 +94,8 @@ pub struct StackResources<const SOCK: usize> {
     queries: MaybeUninit<[Option<dns::DnsQuery>; MAX_QUERIES]>,
     #[cfg(feature = "dhcpv4-hostname")]
     hostname: HostnameResources,
+    #[cfg(feature = "dhcpv4-ntp")]
+    dhcp_packet: MaybeUninit<[u8; DHCP_PACKET_LEN]>,
 }
 
 #[cfg(feature = "dhcpv4-hostname")]
@@ -100,6 +117,8 @@ impl<const SOCK: usize> StackResources<SOCK> {
                 option: MaybeUninit::uninit(),
                 data: MaybeUninit::uninit(),
             },
+            #[cfg(feature = "dhcpv4-ntp")]
+            dhcp_packet: MaybeUninit::uninit(),
         }
     }
 }
@@ -303,6 +322,13 @@ pub(crate) struct Inner {
     dns_waker: WakerRegistration,
     #[cfg(feature = "dhcpv4-hostname")]
     hostname: *mut HostnameResources,
+    /// Receive buffer handed to the DHCP socket, so the lease's options can
+    /// be read.
+    #[cfg(feature = "dhcpv4-ntp")]
+    dhcp_packet: *mut [u8; DHCP_PACKET_LEN],
+    /// NTP servers (option 42) of the current DHCP lease.
+    #[cfg(feature = "dhcpv4-ntp")]
+    dhcp_ntp_servers: Vec<Ipv4Address, MAX_DHCP_NTP_SERVERS>,
 }
 
 fn _assert_covariant<'a, 'b: 'a>(x: Stack<'b>) -> Stack<'a> {
@@ -376,6 +402,10 @@ pub fn new<'d, D: Driver, const SOCK: usize>(
         dns_waker: WakerRegistration::new(),
         #[cfg(feature = "dhcpv4-hostname")]
         hostname: &mut resources.hostname,
+        #[cfg(feature = "dhcpv4-ntp")]
+        dhcp_packet: resources.dhcp_packet.write([0; DHCP_PACKET_LEN]),
+        #[cfg(feature = "dhcpv4-ntp")]
+        dhcp_ntp_servers: Vec::new(),
     };
 
     #[cfg(feature = "proto-ipv4")]
@@ -387,6 +417,31 @@ pub fn new<'d, D: Driver, const SOCK: usize>(
     let inner = &*resources.inner.write(RefCell::new(inner));
     let stack = Stack { inner };
     (stack, Runner { driver, stack })
+}
+
+/// The unicast NTP servers (option 42) of a DHCP message, if that message
+/// is the one that leased `address`. The socket's copy is only refreshed for
+/// messages that fit its buffer, so a stale copy is told apart by its
+/// `yiaddr`.
+#[cfg(feature = "dhcpv4-ntp")]
+fn dhcp_ntp_servers(
+    packet: &smoltcp::wire::DhcpPacket<&[u8]>,
+    address: Ipv4Address,
+) -> Vec<Ipv4Address, MAX_DHCP_NTP_SERVERS> {
+    let mut servers = Vec::new();
+    if packet.your_ip() != address {
+        return servers;
+    }
+    for option in packet.options().filter(|o| o.kind == DHCP_OPT_NTP_SERVERS) {
+        for chunk in option.data.chunks_exact(4) {
+            let server = Ipv4Address::new(chunk[0], chunk[1], chunk[2], chunk[3]);
+            let unicast = !(server.is_unspecified() || server.is_broadcast() || server.is_multicast());
+            if unicast && servers.push(server).is_err() {
+                return servers;
+            }
+        }
+    }
+    servers
 }
 
 fn to_smoltcp_hardware_address(addr: driver::HardwareAddress) -> (HardwareAddress, Medium) {
@@ -453,6 +508,13 @@ impl<'d> Stack<'d> {
         }
 
         v4_up || v6_up
+    }
+
+    /// NTP servers (DHCP option 42) of the current DHCP lease, in the
+    /// server's order. Empty when the lease names none, or with no lease.
+    #[cfg(feature = "dhcpv4-ntp")]
+    pub fn dhcp_ntp_servers(&self) -> Vec<Ipv4Address, MAX_DHCP_NTP_SERVERS> {
+        self.with(|i| i.dhcp_ntp_servers.clone())
     }
 
     /// Wait for the network device to obtain a link signal.
@@ -736,6 +798,15 @@ impl Inner {
                     socket.set_outgoing_options(core::slice::from_ref(option));
                 }
 
+                #[cfg(feature = "dhcpv4-ntp")]
+                {
+                    socket.set_parameter_request_list(DHCP_PARAMETER_REQUEST_LIST);
+                    // safety: the buffer lives in the stack resources, borrowed for as long
+                    // as the stack exists, and only this socket ever holds a reference to it.
+                    let packet: &'static mut [u8] = unsafe { &mut *self.dhcp_packet };
+                    socket.set_receive_packet_buffer(packet);
+                }
+
                 socket.reset();
             }
             _ => {
@@ -906,9 +977,19 @@ impl Inner {
                         None => false,
                         Some(dhcpv4::Event::Deconfigured) => {
                             self.static_v4 = None;
+                            #[cfg(feature = "dhcpv4-ntp")]
+                            self.dhcp_ntp_servers.clear();
                             true
                         }
                         Some(dhcpv4::Event::Configured(config)) => {
+                            #[cfg(feature = "dhcpv4-ntp")]
+                            {
+                                self.dhcp_ntp_servers = config
+                                    .packet
+                                    .as_ref()
+                                    .map(|p| dhcp_ntp_servers(p, config.address.address()))
+                                    .unwrap_or_default();
+                            }
                             self.static_v4 = Some(StaticConfigV4 {
                                 address: config.address,
                                 gateway: config.router,
@@ -920,6 +1001,8 @@ impl Inner {
                 } else if old_link_up {
                     socket.reset();
                     self.static_v4 = None;
+                    #[cfg(feature = "dhcpv4-ntp")]
+                    self.dhcp_ntp_servers.clear();
                     true
                 } else {
                     false
@@ -986,5 +1069,67 @@ impl<'d, D: Driver> Runner<'d, D> {
         })
         .await;
         unreachable!()
+    }
+}
+
+#[cfg(all(test, feature = "dhcpv4-ntp"))]
+mod dhcp_ntp_tests {
+    use super::*;
+
+    /// A DHCP message leasing `yiaddr` with the given options (after the
+    /// 236-byte BOOTP header and the magic cookie).
+    fn message(yiaddr: [u8; 4], options: &[u8]) -> [u8; DHCP_PACKET_LEN] {
+        let mut buf = [0; DHCP_PACKET_LEN];
+        buf[16..20].copy_from_slice(&yiaddr);
+        buf[236..240].copy_from_slice(&[99, 130, 83, 99]);
+        buf[240..240 + options.len()].copy_from_slice(options);
+        buf
+    }
+
+    fn servers(buf: &[u8], leased: [u8; 4]) -> Vec<Ipv4Address, MAX_DHCP_NTP_SERVERS> {
+        let packet = smoltcp::wire::DhcpPacket::new_unchecked(buf);
+        dhcp_ntp_servers(&packet, Ipv4Address::from(leased))
+    }
+
+    const LEASED: [u8; 4] = [172, 24, 42, 7];
+
+    #[test]
+    fn the_lease_s_ntp_servers_are_read_in_order() {
+        // 53 = message type (5 = ACK); 42 = NTP servers, two addresses; 255 = end.
+        let buf = message(LEASED, &[53, 1, 5, 42, 8, 172, 24, 42, 1, 10, 0, 0, 1, 255]);
+        let got = servers(&buf, LEASED);
+        assert_eq!(
+            got.as_slice(),
+            &[Ipv4Address::new(172, 24, 42, 1), Ipv4Address::new(10, 0, 0, 1)]
+        );
+    }
+
+    #[test]
+    fn a_message_for_another_address_yields_nothing() {
+        // A stale copy: the socket keeps the previous message when a longer one does not fit.
+        let buf = message([10, 0, 0, 9], &[42, 4, 172, 24, 42, 1, 255]);
+        assert!(servers(&buf, LEASED).is_empty());
+    }
+
+    #[test]
+    fn non_unicast_and_surplus_servers_are_dropped() {
+        // 0.0.0.0 and a multicast address are skipped; only the first two unicast ones are kept.
+        let buf = message(
+            LEASED,
+            &[
+                42, 20, 0, 0, 0, 0, 224, 0, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 255,
+            ],
+        );
+        let got = servers(&buf, LEASED);
+        assert_eq!(
+            got.as_slice(),
+            &[Ipv4Address::new(1, 1, 1, 1), Ipv4Address::new(2, 2, 2, 2)]
+        );
+    }
+
+    #[test]
+    fn a_lease_without_option_42_has_no_ntp_server() {
+        let buf = message(LEASED, &[53, 1, 5, 3, 4, 172, 24, 42, 1, 255]);
+        assert!(servers(&buf, LEASED).is_empty());
     }
 }

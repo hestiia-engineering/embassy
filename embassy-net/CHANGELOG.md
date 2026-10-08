@@ -8,6 +8,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 <!-- next-header -->
 ## Unreleased - ReleaseDate
 
+- Add `dhcpv4-ntp` feature: request DHCP option 42 and expose the lease's NTP servers via `Stack::dhcp_ntp_servers()`
+
 ## 0.9.1 - 2026-04-16
 
 - Avoid busy looping if network driver's TX buffer is exhausted

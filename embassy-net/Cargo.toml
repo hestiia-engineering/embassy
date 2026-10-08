@@ -445,6 +445,7 @@ dhcpv4 = [
     "smoltcp/socket-dhcpv4",
 ]
 dhcpv4-hostname = ["dhcpv4"]
+dhcpv4-ntp = ["dhcpv4"]
 dns = [
     "smoltcp/socket-dns",
     "smoltcp/proto-dns",
