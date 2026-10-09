@@ -70,11 +70,12 @@ const LOCAL_PORT_MAX: u16 = 65535;
 const MAX_QUERIES: usize = 4;
 #[cfg(feature = "dhcpv4-hostname")]
 const MAX_HOSTNAME_LEN: usize = 32;
-/// Size of the copy of the last DHCP message kept to read option 42 from.
-/// RFC 2131 guarantees 576-byte messages; a longer one is not copied and
-/// yields no NTP servers.
+/// Size of the copy of the last DHCP message kept to read option 42 from:
+/// the maximum message size the socket advertises to the server (option
+/// 57) on a 1500-byte IP MTU, 1500 - 60 (largest IPv4 header) - 8 (UDP).
+/// A longer message is not copied and yields no NTP servers.
 #[cfg(feature = "dhcpv4-ntp")]
-const DHCP_PACKET_LEN: usize = 576;
+const DHCP_PACKET_LEN: usize = 1432;
 /// Parameters requested from the DHCP server: subnet mask, router, DNS
 /// servers (smoltcp's default list) and NTP servers.
 #[cfg(feature = "dhcpv4-ntp")]
@@ -825,8 +826,9 @@ impl Inner {
                 #[cfg(feature = "dhcpv4-ntp")]
                 {
                     socket.set_parameter_request_list(DHCP_PARAMETER_REQUEST_LIST);
-                    // safety: the buffer lives in the stack resources, borrowed for as long
-                    // as the stack exists, and only this socket ever holds a reference to it.
+                    socket.set_receive_packet_buffer(&mut []);
+                    // safety: the socket no longer references the buffer, which lives in the
+                    // stack resources for as long as the stack exists.
                     let packet: &'static mut [u8] = unsafe { &mut *self.dhcp_packet };
                     socket.set_receive_packet_buffer(packet);
                 }
