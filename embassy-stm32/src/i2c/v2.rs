@@ -895,6 +895,15 @@ impl<'d, M: Mode, IM: MasterMode> I2c<'d, M, IM> {
     }
 }
 
+/// Step between two checks of a bus flag on the async path. Timers round up
+/// to whole ticks, so a microsecond step is really one tick (30.5 us at the
+/// common 32.768 kHz tick). Four ticks keep the wake rate on a held bus at a
+/// few thousand per second (~8 k/s at 32.768 kHz) for at most a few hundred
+/// microseconds of extra latency on a bus that frees up, which is small
+/// against a single byte at 100 kHz (90 us).
+#[cfg(feature = "time")]
+const BUS_POLL_STEP: embassy_time::Duration = embassy_time::Duration::from_ticks(4);
+
 impl<'d, IM: MasterMode> I2c<'d, Async, IM> {
     /// Wait until `done` holds or `timeout` passes, yielding to the executor
     /// between checks. The flag loops of the blocking API spin inside `poll`
@@ -907,7 +916,7 @@ impl<'d, IM: MasterMode> I2c<'d, Async, IM> {
             }
             timeout.check()?;
             #[cfg(feature = "time")]
-            embassy_time::Timer::after_micros(20).await;
+            embassy_time::Timer::after(BUS_POLL_STEP).await;
             #[cfg(not(feature = "time"))]
             embassy_futures::yield_now().await;
         }
