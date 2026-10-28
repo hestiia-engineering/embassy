@@ -896,6 +896,38 @@ impl<'d, M: Mode, IM: MasterMode> I2c<'d, M, IM> {
 }
 
 impl<'d, IM: MasterMode> I2c<'d, Async, IM> {
+    /// Wait until `done` holds or `timeout` passes, yielding to the executor
+    /// between checks. The flag loops of the blocking API spin inside `poll`
+    /// instead: on a bus held BUSY that blocks the whole executor for the full
+    /// timeout on every transfer.
+    async fn wait_until(&self, timeout: Timeout, mut done: impl FnMut(&Self) -> bool) -> Result<(), Error> {
+        loop {
+            if done(self) {
+                return Ok(());
+            }
+            timeout.check()?;
+            #[cfg(feature = "time")]
+            embassy_time::Timer::after_micros(20).await;
+            #[cfg(not(feature = "time"))]
+            embassy_futures::yield_now().await;
+        }
+    }
+
+    /// Before a transfer that does not continue the previous one: wait, without
+    /// blocking the executor, for the previous address sequence to end and for
+    /// the bus to be free (a write's software STOP may still be on the wire).
+    async fn wait_bus_free(&self, timeout: Timeout) -> Result<(), Error> {
+        self.wait_until(timeout, |s| !s.info.regs.cr2().read().start()).await?;
+        self.wait_until(timeout, |s| !s.info.regs.isr().read().busy()).await
+    }
+
+    /// Async form of `wait_stop`.
+    async fn wait_stop_async(&self, timeout: Timeout) -> Result<(), Error> {
+        self.wait_until(timeout, |s| s.info.regs.isr().read().stopf()).await?;
+        self.info.regs.icr().modify(|reg| reg.set_stopcf(true));
+        Ok(())
+    }
+
     async fn write_dma_internal(
         &mut self,
         address: Address,
@@ -907,6 +939,10 @@ impl<'d, IM: MasterMode> I2c<'d, Async, IM> {
         timeout: Timeout,
     ) -> Result<(), Error> {
         let total_len = write.len();
+
+        if first_slice && !restart {
+            self.wait_bus_free(timeout).await?;
+        }
 
         let dma_transfer = unsafe {
             let regs = self.info.regs;
@@ -1033,6 +1069,10 @@ impl<'d, IM: MasterMode> I2c<'d, Async, IM> {
         timeout: Timeout,
     ) -> Result<(), Error> {
         let total_len = buffer.len();
+
+        if !restart {
+            self.wait_bus_free(timeout).await?;
+        }
 
         let dma_transfer = unsafe {
             let regs = self.info.regs;
@@ -1363,7 +1403,7 @@ impl<'d, IM: MasterMode> I2c<'d, Async, IM> {
                 )?;
             }
             if is_last_group {
-                self.wait_stop(timeout)?;
+                self.wait_stop_async(timeout).await?;
             }
             return Ok(());
         }
@@ -1417,9 +1457,11 @@ impl<'d, IM: MasterMode> I2c<'d, Async, IM> {
             }
         }
 
-        // Wait for transfer to complete
+        // Wait for transfer to complete. The STOP follows the last byte within a
+        // bus cycle; a fresh deadline keeps a stall during the reads from
+        // failing a transfer that has completed.
         if is_last_group {
-            self.wait_stop(timeout)?;
+            self.wait_stop_async(self.timeout()).await?;
         }
 
         Ok(())
@@ -1435,6 +1477,10 @@ impl<'d, IM: MasterMode> I2c<'d, Async, IM> {
         timeout: Timeout,
     ) -> Result<(), Error> {
         let total_len = buffer.len();
+
+        if !restart {
+            self.wait_bus_free(timeout).await?;
+        }
 
         let dma_transfer = unsafe {
             let regs = self.info.regs;
