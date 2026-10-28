@@ -1151,7 +1151,6 @@ impl<'d, IM: MasterMode> I2c<'d, Async, IM> {
     /// The buffers are concatenated in a single write transaction.
     pub async fn write_vectored(&mut self, address: Address, write: &[&[u8]]) -> Result<(), Error> {
         let _scoped_wake_guard = self.info.rcc.wake_guard();
-        let timeout = self.timeout();
 
         if write.is_empty() {
             return Err(Error::ZeroLengthTransfer);
@@ -1164,6 +1163,9 @@ impl<'d, IM: MasterMode> I2c<'d, Async, IM> {
         while let Some(c) = current {
             let next = iter.next();
             let is_last = next.is_none();
+            // Each slice gets its own deadline, so a stall during one slice
+            // cannot leave the next one starting on an expired deadline.
+            let timeout = self.timeout();
 
             let fut = self.write_dma_internal(
                 address, c, first,   // first_slice
@@ -1205,6 +1207,11 @@ impl<'d, IM: MasterMode> I2c<'d, Async, IM> {
             timeout.with(fut).await?;
         }
 
+        // The read half gets its own deadline. With one deadline for both
+        // halves, a stall during the write half leaves the read starting on an
+        // expired deadline: it is dropped right after its START, and a
+        // multi-byte read then holds SCL low with an unread byte in RXDR.
+        let timeout = self.timeout();
         if read.is_empty() {
             self.read_internal(address.into(), read, true, timeout)?;
         } else {
@@ -1227,7 +1234,6 @@ impl<'d, IM: MasterMode> I2c<'d, Async, IM> {
         }
 
         let address = addr.into();
-        let timeout = self.timeout();
 
         // Group consecutive operations of the same type
         let mut op_idx = 0;
@@ -1245,6 +1251,8 @@ impl<'d, IM: MasterMode> I2c<'d, Async, IM> {
             let group_end = op_idx;
             let is_last_group = op_idx >= operations.len();
 
+            // Each group gets its own deadline, as each half of `write_read`.
+            let timeout = self.timeout();
             // Execute this group of operations
             if is_read {
                 self.execute_read_group_async(
@@ -1313,6 +1321,7 @@ impl<'d, IM: MasterMode> I2c<'d, Async, IM> {
         for (idx, buffer) in write_buffers.iter().enumerate() {
             let is_first_buffer = idx == 0;
             let is_last_buffer = idx == num_buffers - 1;
+            let timeout = if is_first_buffer { timeout } else { self.timeout() };
 
             let fut = self.write_dma_internal(
                 address,
@@ -1386,8 +1395,8 @@ impl<'d, IM: MasterMode> I2c<'d, Async, IM> {
                     };
 
                     // We need a custom DMA read that respects our stop mode
-                    self.read_dma_group_internal(address, buffer, restart, stop_mode, timeout)
-                        .await?;
+                    let fut = self.read_dma_group_internal(address, buffer, restart, stop_mode, timeout);
+                    timeout.with(fut).await?;
                     is_first_in_group = false;
                 } else {
                     // Subsequent buffers: need to reload and continue
@@ -1397,11 +1406,13 @@ impl<'d, IM: MasterMode> I2c<'d, Async, IM> {
                         Stop::Software
                     };
 
-                    self.read_dma_group_internal(
+                    // Each later buffer gets its own deadline, as each write buffer.
+                    let timeout = self.timeout();
+                    let fut = self.read_dma_group_internal(
                         address, buffer, false, // no restart for subsequent buffers in same group
                         stop_mode, timeout,
-                    )
-                    .await?;
+                    );
+                    timeout.with(fut).await?;
                 }
             }
         }
