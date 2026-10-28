@@ -1341,8 +1341,10 @@ impl<'d, IM: MasterMode> I2c<'d, Async, IM> {
         let total_bytes = Self::total_operation_bytes(operations);
 
         if total_bytes == 0 {
-            // Handle empty write group using blocking call
+            // Handle empty write group using blocking call, once the bus is
+            // free so the blocking waits inside do not spin.
             if is_first_group {
+                self.wait_bus_free(timeout).await?;
                 Self::master_write(self.info, address, 0, Stop::Software, false, !is_first_group, timeout)?;
             }
             if is_last_group {
@@ -1399,8 +1401,10 @@ impl<'d, IM: MasterMode> I2c<'d, Async, IM> {
         let total_bytes = Self::total_operation_bytes(operations);
 
         if total_bytes == 0 {
-            // Handle empty read group using blocking call
+            // Handle empty read group using blocking call, once the bus is
+            // free so the blocking waits inside do not spin.
             if is_first_group {
+                self.wait_bus_free(timeout).await?;
                 Self::master_read(
                     self.info,
                     address,
