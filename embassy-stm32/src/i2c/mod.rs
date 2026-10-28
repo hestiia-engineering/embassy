@@ -259,9 +259,13 @@ impl Timeout {
         {
             use futures_util::FutureExt;
 
-            embassy_futures::select::select(embassy_time::Timer::at(self.deadline), fut).map(|r| match r {
-                embassy_futures::select::Either::First(_) => Err(Error::Timeout),
-                embassy_futures::select::Either::Second(r) => r,
+            // The transfer is polled before the timer: after an executor stall
+            // longer than the timeout, a transfer the hardware has finished
+            // completes instead of being dropped half-way (a write dropped
+            // before its STOP leaves SCL held low and the bus BUSY).
+            embassy_futures::select::select(fut, embassy_time::Timer::at(self.deadline)).map(|r| match r {
+                embassy_futures::select::Either::First(r) => r,
+                embassy_futures::select::Either::Second(_) => Err(Error::Timeout),
             })
         }
 
