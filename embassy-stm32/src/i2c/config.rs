@@ -126,7 +126,12 @@ pub struct Config {
     /// have external pullups you should not enable this.
     #[cfg(gpio_v2)]
     pub scl_pullup: bool,
-    /// Timeout.
+    /// Timeout of each stage of an async transfer, measured from when the task
+    /// is next polled: an executor stall alone does not make a transfer fail.
+    ///
+    /// Each stage gets the full timeout: a `write_read` can take up to twice
+    /// this before it fails, and a `transaction` up to this per group and per
+    /// later buffer of a group. The blocking API applies it once per call.
     #[cfg(feature = "time")]
     pub timeout: embassy_time::Duration,
 }
