@@ -18,21 +18,56 @@ struct DmaCtrlImpl<'a>(Channel<'a>);
 impl<'a> DmaCtrl for DmaCtrlImpl<'a> {
     fn get_remaining_transfers(&self) -> usize {
         let state = &STATE[self.0.id as usize];
-        let current_remaining = self.0.get_remaining_transfers() as usize;
-
         let lli_count = state.lli_state.count.load(Ordering::Acquire);
-
-        if lli_count > 0 {
-            // In linked-list mode, the remaining transfers are the sum of the full lengths of LLIs that follow,
-            // and the remaining transfers for the current LLI.
-            let lli_index = state.lli_state.index.load(Ordering::Acquire);
-            let single_transfer_count = state.lli_state.transfer_count.load(Ordering::Acquire) / lli_count;
-
-            (lli_count - lli_index - 1) * single_transfer_count + current_remaining
-        } else {
+        if lli_count == 0 {
             // No linked-list mode.
-            current_remaining
+            return self.0.get_remaining_transfers() as usize;
         }
+
+        // In linked-list mode, the remaining transfers are the sum of the full lengths of LLIs that follow,
+        // and the remaining transfers for the current LLI.
+        //
+        // `lli_state.index` only advances in the IRQ handler. Between the
+        // hardware loading the next item and that handler running, BNDT
+        // already counts the new item while the index still names the old
+        // one: the position then reads one item short, the reader's wrap guard
+        // clamps it to the end of the ring, and the bytes past the real write
+        // position (left from the previous lap) are handed out as new data
+        // while the fresh ones are skipped. In a critical section the handler
+        // cannot run, so a pending TC flag means exactly "one item ahead".
+        // BNDT is read on both sides of the flag so an item boundary crossed
+        // in between is seen and the snapshot retaken.
+        //
+        // BNDT reads 0 while the next item is being linked in (after the TC
+        // flag is raised, and before the very first item is fetched): the
+        // position is then the START of the item the index names once the
+        // flag is accounted for, i.e. a full item remaining, not an empty one.
+        // An unflagged 0 is waited out briefly, as it can also be the instant
+        // the last transfer lands before its TC flag.
+        critical_section::with(|_| {
+            let single_transfer_count = state.lli_state.transfer_count.load(Ordering::Acquire) / lli_count;
+            let mut unflagged_zero_reads = 0u32;
+            loop {
+                let before = self.0.get_remaining_transfers() as usize;
+                let pending = self.0.tc_pending();
+                let mut current_remaining = self.0.get_remaining_transfers() as usize;
+                if current_remaining > before {
+                    continue;
+                }
+                if current_remaining == 0 && !pending && unflagged_zero_reads < 64 {
+                    unflagged_zero_reads += 1;
+                    continue;
+                }
+                let mut lli_index = state.lli_state.index.load(Ordering::Acquire);
+                if pending {
+                    lli_index = (lli_index + 1) % lli_count;
+                }
+                if current_remaining == 0 {
+                    current_remaining = single_transfer_count;
+                }
+                return (lli_count - lli_index - 1) * single_transfer_count + current_remaining;
+            }
+        })
     }
 
     fn reset_complete_count(&mut self) -> usize {
@@ -79,6 +114,13 @@ impl<'a, W: Word> ReadableRingBuffer<'a, W> {
 
     /// Start the ring buffer operation.
     pub fn start(&mut self) {
+        // A restart (e.g. after a USART error) finds the channel only
+        // *requested* to suspend. The channel reset in `configure_linked_list`
+        // is ignored unless the channel is suspended or idle, so the hardware
+        // would carry on in whichever item it was in while the item index is
+        // set back to 0: every position then reads one item (half the ring)
+        // behind, for good. Suspend for real and reset first.
+        self.channel.request_reset();
         // Apply the default configuration to the channel.
         unsafe { self.channel.configure_linked_list(&self.table, self.options) };
         self.table.link(RunMode::Circular);

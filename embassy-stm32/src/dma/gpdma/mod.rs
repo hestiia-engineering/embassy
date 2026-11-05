@@ -209,8 +209,18 @@ pub(crate) unsafe fn on_irq(id: u8) {
     }
 
     if sr.suspf() {
-        // Disable all xxIEs to prevent the irq from firing again.
-        ch.cr().write(|_| {});
+        // Disable all xxIEs to prevent the irq from firing again. Only the
+        // enables: writing the whole register would also clear SUSP, i.e.
+        // resume the channel the caller just suspended.
+        ch.cr().modify(|w| {
+            w.set_tcie(false);
+            w.set_htie(false);
+            w.set_dteie(false);
+            w.set_uleie(false);
+            w.set_useie(false);
+            w.set_suspie(false);
+            w.set_toie(false);
+        });
     }
     state.waker.wake();
 }
@@ -226,6 +236,13 @@ impl<'d> Channel<'d> {
         let word_size: WordSize = ch.tr1().read().ddw().into();
 
         ch.br1().read().bndt() / word_size.bytes() as u16
+    }
+
+    /// Whether a transfer-complete is flagged that the IRQ handler has not
+    /// serviced yet (its LLI bookkeeping is then one item behind the hardware).
+    pub(crate) fn tc_pending(&self) -> bool {
+        let info = self.info();
+        info.dma.ch(info.num).sr().read().tcf()
     }
 
     unsafe fn configure(
@@ -409,8 +426,19 @@ impl<'d> Channel<'d> {
         let info = self.info();
         let ch = info.dma.ch(info.num);
 
-        self.request_pause();
-        while self.is_running() {}
+        // CR.RESET is ignored on an active channel: suspend for real first. A
+        // SUSPF still latched from an earlier suspend would end the wait at
+        // once, so it is cleared before asking.
+        if ch.cr().read().en() {
+            ch.fcr().write(|w| w.set_suspf(true));
+            ch.cr().modify(|w| w.set_susp(true));
+            loop {
+                let sr = ch.sr().read();
+                if sr.suspf() || sr.idlef() {
+                    break;
+                }
+            }
+        }
 
         ch.cr().modify(|w| w.set_reset(true));
     }
