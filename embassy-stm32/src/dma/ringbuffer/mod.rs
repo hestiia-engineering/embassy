@@ -77,11 +77,28 @@ impl DmaIndex {
     }
 }
 
+/// Raw ring positions as last synced from the DMA (diagnostic only):
+/// position in the buffer and completed laps of the write and read indices.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct RingIndices {
+    /// Write index position (DMA side, as of the last sync).
+    pub write_pos: usize,
+    /// Write index completed laps (normalised against the read index).
+    pub write_laps: usize,
+    /// Read index position (consumer side).
+    pub read_pos: usize,
+    /// Read index completed laps.
+    pub read_laps: usize,
+}
+
 pub struct ReadableDmaRingBuffer<'a, W: Word> {
     dma_buf: &'a mut [W],
     write_index: DmaIndex,
     read_index: DmaIndex,
     alignment: usize,
+    /// Indices at the last failed read, before the reset that follows it.
+    last_error_indices: Option<RingIndices>,
 }
 
 impl<'a, W: Word> ReadableDmaRingBuffer<'a, W> {
@@ -92,7 +109,23 @@ impl<'a, W: Word> ReadableDmaRingBuffer<'a, W> {
             write_index: Default::default(),
             read_index: Default::default(),
             alignment: 1,
+            last_error_indices: None,
         }
+    }
+
+    /// The ring indices as last synced (no DMA access, no side effect).
+    pub fn indices(&self) -> RingIndices {
+        RingIndices {
+            write_pos: self.write_index.pos,
+            write_laps: self.write_index.complete_count,
+            read_pos: self.read_index.pos,
+            read_laps: self.read_index.complete_count,
+        }
+    }
+
+    /// The indices of the last failed read (before its reset), once.
+    pub fn take_error_indices(&mut self) -> Option<RingIndices> {
+        self.last_error_indices.take()
     }
 
     /// Set the frame alignment for the ring buffer.
@@ -151,6 +184,7 @@ impl<'a, W: Word> ReadableDmaRingBuffer<'a, W> {
     /// in which case the rinbuffer will automatically reset itself.
     pub fn read(&mut self, dma: &mut impl DmaCtrl, buf: &mut [W]) -> Result<(usize, usize), Error> {
         self.read_raw(dma, buf).inspect_err(|_e| {
+            self.last_error_indices = Some(self.indices());
             self.reset(dma);
         })
     }

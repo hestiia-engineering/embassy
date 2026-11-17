@@ -1262,6 +1262,16 @@ impl<'a, W: Word> ReadableRingBuffer<'a, W> {
         self.channel.start();
     }
 
+    /// Diagnostic: the ring indices as last synced (no side effect).
+    pub fn ring_indices(&self) -> crate::dma::RingIndices {
+        self.ringbuf.indices()
+    }
+
+    /// Diagnostic: the ring indices of the last failed read, once.
+    pub fn take_error_indices(&mut self) -> Option<crate::dma::RingIndices> {
+        self.ringbuf.take_error_indices()
+    }
+
     /// Set the frame alignment for the ring buffer.
     ///
     /// See [`ReadableDmaRingBuffer::set_alignment`] for details.

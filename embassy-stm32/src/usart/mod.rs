@@ -2057,7 +2057,7 @@ pub use crate::usart::buffered::InterruptHandler as BufferedInterruptHandler;
 mod buffered;
 
 mod ringbuffered;
-pub use ringbuffered::RingBufferedUartRx;
+pub use ringbuffered::{RX_ERROR_SOURCES, RingBufferedUartRx, RxDiagCounters, RxErrorDiag, RxErrorSource, RxLiveDiag};
 
 #[cfg(any(usart_v1, usart_v2))]
 fn tdr(r: crate::pac::usart::Usart) -> *mut u8 {

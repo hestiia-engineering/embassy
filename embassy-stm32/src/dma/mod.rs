@@ -23,6 +23,7 @@ mod util;
 pub(crate) use util::*;
 
 pub(crate) mod ringbuffer;
+pub use ringbuffer::RingIndices;
 pub mod word;
 
 use core::marker::PhantomData;

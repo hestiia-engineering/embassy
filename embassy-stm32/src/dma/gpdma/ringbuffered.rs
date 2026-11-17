@@ -187,6 +187,21 @@ impl<'a, W: Word> ReadableRingBuffer<'a, W> {
         self.ringbuf.cap()
     }
 
+    /// Diagnostic: the ring indices as last synced (no side effect).
+    pub fn ring_indices(&self) -> crate::dma::RingIndices {
+        self.ringbuf.indices()
+    }
+
+    /// Diagnostic: the ring indices of the last failed read, once.
+    pub fn take_error_indices(&mut self) -> Option<crate::dma::RingIndices> {
+        self.ringbuf.take_error_indices()
+    }
+
+    /// Diagnostic: raw channel `(SR, CR, BR1, LLI index)` (register reads only).
+    pub fn channel_regs(&self) -> (u32, u32, u32, u32) {
+        self.channel.diag_regs()
+    }
+
     /// Set a waker to be woken when at least one byte is received.
     pub fn set_waker(&mut self, waker: &Waker) {
         DmaCtrlImpl(self.channel.reborrow()).set_waker(waker);

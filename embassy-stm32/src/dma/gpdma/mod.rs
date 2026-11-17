@@ -238,6 +238,15 @@ impl<'d> Channel<'d> {
         ch.br1().read().bndt() / word_size.bytes() as u16
     }
 
+    /// Raw channel registers for diagnostics: `(SR, CR, BR1, LLI index)`.
+    /// Register reads only, no side effect.
+    pub(crate) fn diag_regs(&self) -> (u32, u32, u32, u32) {
+        let info = self.info();
+        let ch = info.dma.ch(info.num);
+        let lli = STATE[self.id as usize].lli_state.index.load(Ordering::Relaxed) as u32;
+        (ch.sr().read().0, ch.cr().read().0, ch.br1().read().0, lli)
+    }
+
     /// Whether a transfer-complete is flagged that the IRQ handler has not
     /// serviced yet (its LLI bookkeeping is then one item behind the hardware).
     pub(crate) fn tc_pending(&self) -> bool {

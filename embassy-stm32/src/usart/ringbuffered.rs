@@ -84,6 +84,82 @@ pub struct RingBufferedUartRx<'d> {
     _rx: Option<Flex<'d>>,
     _rts: Option<Flex<'d>>,
     ring_buf: ReadableRingBuffer<'d, u8>,
+    diag: RxDiagCounters,
+    diag_last_error: Option<RxErrorDiag>,
+}
+
+/// Where a `read()` error came from. Diagnostic only: the error returned to
+/// the caller is unchanged (every ring error is still reported as
+/// [`Error::Overrun`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[repr(u8)]
+pub enum RxErrorSource {
+    /// A USART error flag found when the read began, with the receiver
+    /// running (CR3.DMAR set).
+    UsartAtEntryRunning = 0,
+    /// A USART error flag found when the read began, with the receiver
+    /// stopped by an earlier error (CR3.DMAR clear): the read returns before
+    /// it restarts the receiver.
+    UsartAtEntryStopped = 1,
+    /// A USART error flag raised while the read waited for data.
+    UsartWhileWaiting = 2,
+    /// The DMA lapped the read index (ring overrun).
+    RingOverrun = 3,
+    /// The DMA position went backwards against the read index.
+    RingDmaUnsynced = 4,
+}
+
+/// Number of [`RxErrorSource`] variants.
+pub const RX_ERROR_SOURCES: usize = 5;
+
+/// Register and ring state captured when a `read()` error is detected,
+/// before the receiver is stopped. Diagnostic only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct RxErrorDiag {
+    /// Where the error came from.
+    pub source: RxErrorSource,
+    /// USART ISR (SR on v1/v2), raw. For a USART-flag error, the value the
+    /// flag check read (before it cleared the flags); otherwise read live.
+    pub isr: u32,
+    /// USART CR1, raw.
+    pub cr1: u32,
+    /// USART CR3, raw (DMAR is bit 6).
+    pub cr3: u32,
+    /// DMA channel `(SR, CR, BR1, LLI index)` on GPDMA, zeros elsewhere.
+    pub dma: (u32, u32, u32, u32),
+    /// Ring indices: those of the failed ring read (before its reset) for a
+    /// ring error, the current ones otherwise.
+    pub ring: crate::dma::RingIndices,
+}
+
+/// Cumulative receive-path counters. Diagnostic only.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct RxDiagCounters {
+    /// Errors returned by `read()`, by [`RxErrorSource`].
+    pub errors: [u32; RX_ERROR_SOURCES],
+    /// Times a read found the receiver stopped and restarted it.
+    pub auto_restarts: u32,
+}
+
+/// Live receive-path state (register reads only). Diagnostic only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct RxLiveDiag {
+    /// USART ISR (SR on v1/v2), raw.
+    pub isr: u32,
+    /// USART CR1, raw.
+    pub cr1: u32,
+    /// USART CR3, raw.
+    pub cr3: u32,
+    /// DMA channel `(SR, CR, BR1, LLI index)` on GPDMA, zeros elsewhere.
+    pub dma: (u32, u32, u32, u32),
+    /// Ring indices as last synced.
+    pub ring: crate::dma::RingIndices,
+    /// Cumulative counters.
+    pub counters: RxDiagCounters,
 }
 
 impl<'d> SetConfig for RingBufferedUartRx<'d> {
@@ -128,6 +204,8 @@ impl<'d> UartRx<'d, Async> {
             _rx: rx,
             _rts: rts,
             ring_buf,
+            diag: RxDiagCounters::default(),
+            diag_last_error: None,
         }
     }
 }
@@ -224,11 +302,70 @@ impl<'d> RingBufferedUartRx<'d> {
     fn start_dma_or_check_errors(&mut self) -> Result<(), Error> {
         let r = self.info.regs;
 
-        check_idle_and_errors(r)?;
+        let (res, isr) = check_idle_and_errors_sr(r);
+        if let Err(e) = res {
+            let source = if r.cr3().read().dmar() {
+                RxErrorSource::UsartAtEntryRunning
+            } else {
+                RxErrorSource::UsartAtEntryStopped
+            };
+            self.diag_record(source, Some(isr), None);
+            return Err(e);
+        }
         if !r.cr3().read().dmar() {
+            self.diag.auto_restarts = self.diag.auto_restarts.wrapping_add(1);
             self.start_uart();
         }
         Ok(())
+    }
+
+    /// Record a `read()` error for diagnostics (register reads only).
+    fn diag_record(&mut self, source: RxErrorSource, isr: Option<u32>, ring: Option<crate::dma::RingIndices>) {
+        let r = self.info.regs;
+        let i = source as usize;
+        self.diag.errors[i] = self.diag.errors[i].wrapping_add(1);
+        self.diag_last_error = Some(RxErrorDiag {
+            source,
+            isr: isr.unwrap_or_else(|| sr(r).read().0),
+            cr1: r.cr1().read().0,
+            cr3: r.cr3().read().0,
+            dma: self.diag_dma_regs(),
+            ring: ring.unwrap_or_else(|| self.ring_buf.ring_indices()),
+        });
+    }
+
+    #[cfg(gpdma)]
+    fn diag_dma_regs(&self) -> (u32, u32, u32, u32) {
+        self.ring_buf.channel_regs()
+    }
+
+    #[cfg(not(gpdma))]
+    fn diag_dma_regs(&self) -> (u32, u32, u32, u32) {
+        (0, 0, 0, 0)
+    }
+
+    /// Diagnostic: the state captured at the last `read()` error, once.
+    pub fn take_last_error_diag(&mut self) -> Option<RxErrorDiag> {
+        self.diag_last_error.take()
+    }
+
+    /// Diagnostic: cumulative receive-path counters.
+    pub fn diag_counters(&self) -> RxDiagCounters {
+        self.diag
+    }
+
+    /// Diagnostic: live register and ring state (register reads only; the
+    /// status register is read, never cleared).
+    pub fn diag_live(&self) -> RxLiveDiag {
+        let r = self.info.regs;
+        RxLiveDiag {
+            isr: sr(r).read().0,
+            cr1: r.cr1().read().0,
+            cr3: r.cr3().read().0,
+            dma: self.diag_dma_regs(),
+            ring: self.ring_buf.ring_indices(),
+            counters: self.diag,
+        }
     }
 
     /// Read bytes that are available in the ring buffer, or wait for
@@ -260,7 +397,13 @@ impl<'d> RingBufferedUartRx<'d> {
                 Ok((len, _)) => {
                     return Ok(len);
                 }
-                Err(_) => {
+                Err(e) => {
+                    let source = match e {
+                        crate::dma::ringbuffer::Error::Overrun => RxErrorSource::RingOverrun,
+                        crate::dma::ringbuffer::Error::DmaUnsynced => RxErrorSource::RingDmaUnsynced,
+                    };
+                    let ring = self.ring_buf.take_error_indices();
+                    self.diag_record(source, None, ring);
                     self.stop_uart();
                     return Err(Error::Overrun);
                 }
@@ -268,7 +411,8 @@ impl<'d> RingBufferedUartRx<'d> {
 
             match self.wait_for_data_or_idle().await {
                 Ok(_) => {}
-                Err(err) => {
+                Err((err, isr)) => {
+                    self.diag_record(RxErrorSource::UsartWhileWaiting, Some(isr), None);
                     self.stop_uart();
                     return Err(err);
                 }
@@ -276,8 +420,9 @@ impl<'d> RingBufferedUartRx<'d> {
         }
     }
 
-    /// Wait for uart idle or dma half-full or full
-    async fn wait_for_data_or_idle(&mut self) -> Result<(), Error> {
+    /// Wait for uart idle or dma half-full or full. An error carries the raw
+    /// status register value the flag check read.
+    async fn wait_for_data_or_idle(&mut self) -> Result<(), (Error, u32)> {
         compiler_fence(Ordering::SeqCst);
 
         loop {
@@ -295,7 +440,8 @@ impl<'d> RingBufferedUartRx<'d> {
                 // Instead, return from this future and we'll check the length afterwards.
                 let eager = s.eager_reads.load(Ordering::Relaxed) > 0;
 
-                let idle = check_idle_and_errors(self.info.regs)?;
+                let (res, isr) = check_idle_and_errors_sr(self.info.regs);
+                let idle = res.map_err(|e| (e, isr))?;
                 if idle || (eager && uart_init) {
                     // Idle line is detected, or eager reads is set and some data is available.
                     Poll::Ready(Ok(idle))
@@ -366,10 +512,21 @@ impl Drop for RingBufferedUartRx<'_> {
 ///
 /// For usart_v1 and usart_v2, all status flags must be handled together anyway because all flags
 /// are cleared by a single read to the RDR register.
-fn check_idle_and_errors(r: Regs) -> Result<bool, Error> {
+///
+/// Also returns the raw status register value it read (before clearing), for
+/// diagnostics.
+fn check_idle_and_errors_sr(r: Regs) -> (Result<bool, Error>, u32) {
     // SAFETY: read only and we only use Rx related flags
     let sr = sr(r).read();
+    (check_idle_and_errors_from(r, sr), sr.0)
+}
 
+#[cfg(any(usart_v1, usart_v2))]
+type SrVal = super::regs::Sr;
+#[cfg(any(usart_v3, usart_v4))]
+type SrVal = super::regs::Isr;
+
+fn check_idle_and_errors_from(r: Regs, sr: SrVal) -> Result<bool, Error> {
     #[cfg(not(any(usart_v3, usart_v4)))]
     unsafe {
         // This read also clears the error and idle interrupt flags on v1 (TODO and v2?)
@@ -412,7 +569,13 @@ impl embedded_hal_nb::serial::Read for RingBufferedUartRx<'_> {
                 assert!(len == 1);
                 Ok(buf[0])
             }
-            Err(_) => {
+            Err(e) => {
+                let source = match e {
+                    crate::dma::ringbuffer::Error::Overrun => RxErrorSource::RingOverrun,
+                    crate::dma::ringbuffer::Error::DmaUnsynced => RxErrorSource::RingDmaUnsynced,
+                };
+                let ring = self.ring_buf.take_error_indices();
+                self.diag_record(source, None, ring);
                 self.stop_uart();
                 Err(nb::Error::Other(Error::Overrun))
             }
