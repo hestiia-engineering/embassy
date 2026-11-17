@@ -86,6 +86,7 @@ pub struct RingBufferedUartRx<'d> {
     ring_buf: ReadableRingBuffer<'d, u8>,
     diag: RxDiagCounters,
     diag_last_error: Option<RxErrorDiag>,
+    diag_inject_armed: bool,
 }
 
 /// Where a `read()` error came from. Diagnostic only: the error returned to
@@ -108,10 +109,12 @@ pub enum RxErrorSource {
     RingOverrun = 3,
     /// The DMA position went backwards against the read index.
     RingDmaUnsynced = 4,
+    /// A ring overrun injected on request ([`RingBufferedUartRx::diag_arm_inject_stop`]).
+    Injected = 5,
 }
 
 /// Number of [`RxErrorSource`] variants.
-pub const RX_ERROR_SOURCES: usize = 5;
+pub const RX_ERROR_SOURCES: usize = 6;
 
 /// Register and ring state captured when a `read()` error is detected,
 /// before the receiver is stopped. Diagnostic only.
@@ -206,6 +209,7 @@ impl<'d> UartRx<'d, Async> {
             ring_buf,
             diag: RxDiagCounters::default(),
             diag_last_error: None,
+            diag_inject_armed: false,
         }
     }
 }
@@ -344,6 +348,19 @@ impl<'d> RingBufferedUartRx<'d> {
         (0, 0, 0, 0)
     }
 
+    /// Diagnostic (bench): the next `read()` that drains bytes from the ring
+    /// takes the ring-overrun error path instead of returning them: the
+    /// ring is reset, the receiver stopped (`stop_uart`) and `Overrun`
+    /// returned, exactly as on a real ring overrun.
+    pub fn diag_arm_inject_stop(&mut self) {
+        self.diag_inject_armed = true;
+    }
+
+    /// Diagnostic: whether an injected stop is still pending.
+    pub fn diag_inject_armed(&self) -> bool {
+        self.diag_inject_armed
+    }
+
     /// Diagnostic: the state captured at the last `read()` error, once.
     pub fn take_last_error_diag(&mut self) -> Option<RxErrorDiag> {
         self.diag_last_error.take()
@@ -394,6 +411,15 @@ impl<'d> RingBufferedUartRx<'d> {
         loop {
             match self.ring_buf.read(buf) {
                 Ok((0, _)) => {}
+                Ok((_, _)) if self.diag_inject_armed => {
+                    // Same steps as the ring-overrun arm below; only the
+                    // trigger differs.
+                    self.diag_inject_armed = false;
+                    self.ring_buf.clear();
+                    self.diag_record(RxErrorSource::Injected, None, None);
+                    self.stop_uart();
+                    return Err(Error::Overrun);
+                }
                 Ok((len, _)) => {
                     return Ok(len);
                 }
