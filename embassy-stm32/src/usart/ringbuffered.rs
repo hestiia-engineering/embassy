@@ -274,6 +274,14 @@ impl<'d> RingBufferedUartRx<'d> {
         let r = self.info.regs;
         let sr_val = sr(r).read();
         clear_interrupt_flags(r, sr_val);
+        // A full RX FIFO with a byte waiting in the shift register keeps
+        // ORE raised however often it is cleared: flush the FIFO (RXFRQ),
+        // then clear ORE again.
+        #[cfg(any(usart_v3, usart_v4))]
+        {
+            r.rqr().write(|w| w.set_rxfrq(true));
+            r.icr().write(|w| w.set_ore(true));
+        }
         self.start_uart();
     }
 
@@ -307,19 +315,24 @@ impl<'d> RingBufferedUartRx<'d> {
         let r = self.info.regs;
 
         let (res, isr) = check_idle_and_errors_sr(r);
-        if let Err(e) = res {
+        if res.is_err() {
             let source = if r.cr3().read().dmar() {
                 RxErrorSource::UsartAtEntryRunning
             } else {
                 RxErrorSource::UsartAtEntryStopped
             };
             self.diag_record(source, Some(isr), None);
-            return Err(e);
         }
+        // Upstream embassy-rs/embassy#7196 (e9fb6fa31, "Unconditionally
+        // restart DMA on error"): restart a stopped receiver BEFORE reporting
+        // the flag error. Returning first left it stopped: under a steady
+        // stream every later read found ORE again and returned before
+        // restarting, so reception never resumed.
         if !r.cr3().read().dmar() {
             self.diag.auto_restarts = self.diag.auto_restarts.wrapping_add(1);
             self.start_uart();
         }
+        res?;
         Ok(())
     }
 
