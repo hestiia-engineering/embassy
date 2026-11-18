@@ -1,6 +1,6 @@
 use core::future::poll_fn;
 use core::mem;
-use core::sync::atomic::{Ordering, compiler_fence};
+use core::sync::atomic::{Ordering, compiler_fence, fence};
 use core::task::Poll;
 
 use embassy_embedded_hal::SetConfig;
@@ -84,6 +84,8 @@ pub struct RingBufferedUartRx<'d> {
     _rx: Option<Flex<'d>>,
     _rts: Option<Flex<'d>>,
     ring_buf: ReadableRingBuffer<'d, u8>,
+    /// The receiver was started once: later restarts are recoveries.
+    started_once: bool,
 }
 
 impl<'d> SetConfig for RingBufferedUartRx<'d> {
@@ -128,6 +130,7 @@ impl<'d> UartRx<'d, Async> {
             _rx: rx,
             _rts: rts,
             ring_buf,
+            started_once: false,
         }
     }
 }
@@ -146,6 +149,7 @@ impl<'d> RingBufferedUartRx<'d> {
     /// Note: This is also done automatically by the read functions if
     /// required.
     pub fn start_uart(&mut self) {
+        self.started_once = true;
         // Clear the buffer so that it is ready to receive data
         compiler_fence(Ordering::SeqCst);
         self.ring_buf.start();
@@ -159,7 +163,24 @@ impl<'d> RingBufferedUartRx<'d> {
         self.ring_buf.clear();
 
         let r = self.info.regs;
-        // clear all interrupts and DMA Rx Request
+        // A stale ORE seen by the error interrupt before the DMA request is
+        // live would stop the receiver again before it moved a byte: flush the
+        // FIFO and clear the error flags, enable DMAR, then the interrupts.
+        #[cfg(any(usart_v3, usart_v4))]
+        {
+            r.rqr().write(|w| w.set_rxfrq(true));
+            r.icr().write(|w| {
+                w.set_pe(true);
+                w.set_fe(true);
+                w.set_ne(true);
+                w.set_ore(true);
+            });
+        }
+        r.cr3().modify(|w| {
+            // enable DMA Rx Request
+            w.set_dmar(true);
+        });
+        fence(Ordering::SeqCst);
         r.cr1().modify(|w| {
             // use RXNE only when returning reads early
             w.set_rxneie(self.state.eager_reads.load(Ordering::Relaxed) > 0);
@@ -171,8 +192,6 @@ impl<'d> RingBufferedUartRx<'d> {
         r.cr3().modify(|w| {
             // enable Error Interrupt: (Frame error, Noise error, Overrun error)
             w.set_eie(true);
-            // enable DMA Rx Request
-            w.set_dmar(true);
         });
     }
 
@@ -192,15 +211,59 @@ impl<'d> RingBufferedUartRx<'d> {
         let r = self.info.regs;
         let sr_val = sr(r).read();
         clear_interrupt_flags(r, sr_val);
+        // A full RX FIFO with a byte in the shift register raises ORE again
+        // as soon as it is cleared: flush the FIFO, then clear ORE.
+        #[cfg(any(usart_v3, usart_v4))]
+        {
+            r.rqr().write(|w| w.set_rxfrq(true));
+            r.icr().write(|w| w.set_ore(true));
+        }
+        self.restart();
+    }
+
+    /// Start the receiver; a restart after the first start is a recovery and
+    /// goes through [`Self::restart_with_ue_cycle`].
+    fn restart(&mut self) {
+        if self.started_once {
+            self.restart_with_ue_cycle();
+        } else {
+            self.start_uart();
+        }
+    }
+
+    /// Restart a stopped receiver from a clean USART. A USART→DMA request
+    /// can stay latched across a channel reset, leaving the channel enabled
+    /// with no transfer ever running; only CR1.UE = 0 drops it. BRR and the
+    /// other settings are kept.
+    fn restart_with_ue_cycle(&mut self) {
+        self.stop_uart();
+        self.ring_buf.request_reset();
+        let r = self.info.regs;
+        // UE = 0 would cut a frame still being sent on the same USART.
+        if r.cr1().read().te() {
+            for _ in 0..200_000 {
+                if sr(r).read().tc() {
+                    break;
+                }
+            }
+        }
+        r.cr1().modify(|w| w.set_ue(false));
+        r.cr1().modify(|w| w.set_ue(true));
+        compiler_fence(Ordering::SeqCst);
         self.start_uart();
     }
 
     /// Stop DMA backed UART receiver
     fn stop_uart(&mut self) {
-        self.ring_buf.request_pause();
-
         let r = self.info.regs;
-        // clear all interrupts and DMA Rx Request
+        // DMA request and interrupts off before the channel is suspended, so
+        // no request is raised towards a channel that will not serve it.
+        r.cr3().modify(|w| {
+            // disable Error Interrupt: (Frame error, Noise error, Overrun error)
+            w.set_eie(false);
+            // disable DMA Rx Request
+            w.set_dmar(false);
+        });
         r.cr1().modify(|w| {
             // disable RXNE interrupt
             w.set_rxneie(false);
@@ -209,12 +272,9 @@ impl<'d> RingBufferedUartRx<'d> {
             // disable idle line interrupt
             w.set_idleie(false);
         });
-        r.cr3().modify(|w| {
-            // disable Error Interrupt: (Frame error, Noise error, Overrun error)
-            w.set_eie(false);
-            // disable DMA Rx Request
-            w.set_dmar(false);
-        });
+        fence(Ordering::SeqCst);
+
+        self.ring_buf.request_pause();
 
         compiler_fence(Ordering::SeqCst);
     }
@@ -224,10 +284,13 @@ impl<'d> RingBufferedUartRx<'d> {
     fn start_dma_or_check_errors(&mut self) -> Result<(), Error> {
         let r = self.info.regs;
 
-        check_idle_and_errors(r)?;
+        let res = check_idle_and_errors(r);
+        // Restart a stopped receiver even when a flag error is reported, else
+        // a steady stream keeps it stopped (embassy-rs/embassy#7196).
         if !r.cr3().read().dmar() {
-            self.start_uart();
+            self.restart();
         }
+        res?;
         Ok(())
     }
 
