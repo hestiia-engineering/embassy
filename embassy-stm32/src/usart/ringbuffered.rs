@@ -87,6 +87,10 @@ pub struct RingBufferedUartRx<'d> {
     diag: RxDiagCounters,
     diag_last_error: Option<RxErrorDiag>,
     diag_inject_armed: bool,
+    /// The armed injection holds the receiver stopped once it fires.
+    diag_inject_hold: bool,
+    /// Bench hold in force: nothing restarts the receiver until released.
+    diag_hold: bool,
 }
 
 /// Where a `read()` error came from. Diagnostic only: the error returned to
@@ -210,6 +214,8 @@ impl<'d> UartRx<'d, Async> {
             diag: RxDiagCounters::default(),
             diag_last_error: None,
             diag_inject_armed: false,
+            diag_inject_hold: false,
+            diag_hold: false,
         }
     }
 }
@@ -274,7 +280,10 @@ impl<'d> RingBufferedUartRx<'d> {
         let r = self.info.regs;
         let sr_val = sr(r).read();
         clear_interrupt_flags(r, sr_val);
-        self.start_uart();
+        // Bench hold (diag_arm_inject_stop_hold): the receiver stays stopped.
+        if !self.diag_hold {
+            self.start_uart();
+        }
     }
 
     /// Stop DMA backed UART receiver
@@ -316,7 +325,7 @@ impl<'d> RingBufferedUartRx<'d> {
             self.diag_record(source, Some(isr), None);
             return Err(e);
         }
-        if !r.cr3().read().dmar() {
+        if !r.cr3().read().dmar() && !self.diag_hold {
             self.diag.auto_restarts = self.diag.auto_restarts.wrapping_add(1);
             self.start_uart();
         }
@@ -354,6 +363,26 @@ impl<'d> RingBufferedUartRx<'d> {
     /// returned, exactly as on a real ring overrun.
     pub fn diag_arm_inject_stop(&mut self) {
         self.diag_inject_armed = true;
+        self.diag_inject_hold = false;
+    }
+
+    /// Diagnostic (bench): as [`Self::diag_arm_inject_stop`], and once it
+    /// fires the receiver is held stopped (no read and no `reset_rx`
+    /// restarts it; reads see the stopped receiver's flags and silence)
+    /// until [`Self::diag_release_hold`].
+    pub fn diag_arm_inject_stop_hold(&mut self) {
+        self.diag_inject_armed = true;
+        self.diag_inject_hold = true;
+    }
+
+    /// Diagnostic: whether a bench hold is in force.
+    pub fn diag_held(&self) -> bool {
+        self.diag_hold
+    }
+
+    /// Diagnostic: release a bench hold; the read path is normal again.
+    pub fn diag_release_hold(&mut self) {
+        self.diag_hold = false;
     }
 
     /// Diagnostic: whether an injected stop is still pending.
@@ -415,6 +444,7 @@ impl<'d> RingBufferedUartRx<'d> {
                     // Same steps as the ring-overrun arm below; only the
                     // trigger differs.
                     self.diag_inject_armed = false;
+                    self.diag_hold = core::mem::take(&mut self.diag_inject_hold);
                     self.ring_buf.clear();
                     self.diag_record(RxErrorSource::Injected, None, None);
                     self.stop_uart();
