@@ -2,7 +2,7 @@
 
 use core::future::Future;
 use core::pin::Pin;
-use core::sync::atomic::{AtomicUsize, Ordering, compiler_fence, fence};
+use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering, compiler_fence, fence};
 use core::task::{Context, Poll};
 
 use embassy_sync::waitqueue::AtomicWaker;
@@ -17,6 +17,43 @@ use crate::rcc::WakeGuard;
 
 pub mod linked_list;
 pub mod ringbuffered;
+
+/// Diagnostic (bench) counters of `request_reset`, per channel id:
+/// resets requested, and resets after which CxCR.EN still read 1.
+static DIAG_RESETS: [AtomicU32; super::CHANNEL_COUNT] = [const { AtomicU32::new(0) }; super::CHANNEL_COUNT];
+static DIAG_EN_AFTER_RESET: [AtomicU32; super::CHANNEL_COUNT] =
+    [const { AtomicU32::new(0) }; super::CHANNEL_COUNT];
+/// CxCR / CxSR read right after the last RESET write, per channel id.
+static DIAG_LAST_RESET_CR: [AtomicU32; super::CHANNEL_COUNT] =
+    [const { AtomicU32::new(0) }; super::CHANNEL_COUNT];
+static DIAG_LAST_RESET_SR: [AtomicU32; super::CHANNEL_COUNT] =
+    [const { AtomicU32::new(0) }; super::CHANNEL_COUNT];
+
+/// Diagnostic `request_reset` record of one channel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct DiagResetCounts {
+    /// Resets requested.
+    pub resets: u32,
+    /// Resets after which CxCR.EN still read 1.
+    pub en_after_reset: u32,
+    /// CxCR read right after the last RESET write.
+    pub last_cr: u32,
+    /// CxSR read right after the last RESET write.
+    pub last_sr: u32,
+}
+
+/// Diagnostic (bench): the `request_reset` record of channel `id` (the
+/// global DMA channel index).
+pub fn diag_reset_counts(id: usize) -> DiagResetCounts {
+    let id = id.min(super::CHANNEL_COUNT - 1);
+    DiagResetCounts {
+        resets: DIAG_RESETS[id].load(Ordering::Relaxed),
+        en_after_reset: DIAG_EN_AFTER_RESET[id].load(Ordering::Relaxed),
+        last_cr: DIAG_LAST_RESET_CR[id].load(Ordering::Relaxed),
+        last_sr: DIAG_LAST_RESET_SR[id].load(Ordering::Relaxed),
+    }
+}
 
 pub(crate) struct ChannelInfo {
     pub(crate) dma: pac::gpdma::Gpdma,
@@ -247,6 +284,13 @@ impl<'d> Channel<'d> {
         (ch.sr().read().0, ch.cr().read().0, ch.br1().read().0, lli)
     }
 
+    /// Diagnostic: `(GPDMA block address, channel number in the block, global
+    /// channel id)`.
+    pub(crate) fn diag_ids(&self) -> (usize, u8, u8) {
+        let info = self.info();
+        (info.dma.as_ptr() as usize, info.num as u8, self.id)
+    }
+
     /// Whether a transfer-complete is flagged that the IRQ handler has not
     /// serviced yet (its LLI bookkeeping is then one item behind the hardware).
     pub(crate) fn tc_pending(&self) -> bool {
@@ -450,6 +494,16 @@ impl<'d> Channel<'d> {
         }
 
         ch.cr().modify(|w| w.set_reset(true));
+
+        // Diagnostic only: register reads and counters.
+        let id = self.id as usize;
+        let cr = ch.cr().read();
+        DIAG_RESETS[id].fetch_add(1, Ordering::Relaxed);
+        if cr.en() {
+            DIAG_EN_AFTER_RESET[id].fetch_add(1, Ordering::Relaxed);
+        }
+        DIAG_LAST_RESET_CR[id].store(cr.0, Ordering::Relaxed);
+        DIAG_LAST_RESET_SR[id].store(ch.sr().read().0, Ordering::Relaxed);
     }
 
     fn is_running(&self) -> bool {

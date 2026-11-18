@@ -409,6 +409,72 @@ impl<'d> RingBufferedUartRx<'d> {
         self.diag_inject_hold = true;
     }
 
+    /// Diagnostic: `(USART block address, GPDMA block address, RX channel
+    /// number in that block, global DMA channel id)`; zeros for the DMA
+    /// part on non-GPDMA chips.
+    pub fn diag_reg_ptrs(&self) -> (usize, usize, u8, u8) {
+        let usart = self.info.regs.as_ptr() as usize;
+        #[cfg(gpdma)]
+        {
+            let (dma, num, id) = self.ring_buf.channel_ids();
+            (usart, dma, num, id)
+        }
+        #[cfg(not(gpdma))]
+        {
+            (usart, 0, 0, 0)
+        }
+    }
+
+    /// Diagnostic poke (bench): stop the receiver the way an error does
+    /// (`stop_uart`: channel suspend requested, then CR1/CR3 interrupt and
+    /// DMAR enables cleared) and reset the channel; the next read restarts
+    /// it.
+    pub fn diag_poke_restart(&mut self) {
+        self.stop_uart();
+        self.ring_buf.request_reset();
+    }
+
+    /// Diagnostic poke (bench): clear CR3.DMAR/EIE and the CR1 interrupt
+    /// enables FIRST, then suspend and reset the channel; the next read
+    /// restarts it.
+    pub fn diag_poke_dmar_first_stop(&mut self) {
+        self.diag_disable_requests();
+        self.ring_buf.request_pause();
+        self.ring_buf.request_reset();
+    }
+
+    /// Diagnostic poke (bench): as [`Self::diag_poke_dmar_first_stop`], then
+    /// cycle CR1.UE 0 -> 1 (BRR untouched; waits, bounded, for TC first so
+    /// a frame on TX is not cut). UE=0 resets the USART's DMA requests and
+    /// status flags. The next read restarts the receiver.
+    pub fn diag_poke_ue_cycle(&mut self) {
+        self.diag_disable_requests();
+        self.ring_buf.request_pause();
+        self.ring_buf.request_reset();
+        let r = self.info.regs;
+        for _ in 0..100_000 {
+            if sr(r).read().tc() {
+                break;
+            }
+        }
+        r.cr1().modify(|w| w.set_ue(false));
+        r.cr1().modify(|w| w.set_ue(true));
+    }
+
+    fn diag_disable_requests(&mut self) {
+        let r = self.info.regs;
+        r.cr3().modify(|w| {
+            w.set_eie(false);
+            w.set_dmar(false);
+        });
+        r.cr1().modify(|w| {
+            w.set_rxneie(false);
+            w.set_peie(false);
+            w.set_idleie(false);
+        });
+        compiler_fence(Ordering::SeqCst);
+    }
+
     /// Diagnostic: whether a bench hold is in force.
     pub fn diag_held(&self) -> bool {
         self.diag_hold

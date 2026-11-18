@@ -197,6 +197,11 @@ impl<'a, W: Word> ReadableRingBuffer<'a, W> {
         self.ringbuf.take_error_indices()
     }
 
+    /// Diagnostic: `(GPDMA block address, channel number, global channel id)`.
+    pub fn channel_ids(&self) -> (usize, u8, u8) {
+        self.channel.diag_ids()
+    }
+
     /// Diagnostic: raw channel `(SR, CR, BR1, LLI index)` (register reads only).
     pub fn channel_regs(&self) -> (u32, u32, u32, u32) {
         self.channel.diag_regs()
