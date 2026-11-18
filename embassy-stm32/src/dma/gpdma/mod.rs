@@ -426,21 +426,37 @@ impl<'d> Channel<'d> {
         let info = self.info();
         let ch = info.dma.ch(info.num);
 
-        // CR.RESET is ignored on an active channel: suspend for real first. A
-        // SUSPF still latched from an earlier suspend would end the wait at
-        // once, so it is cleared before asking.
-        if ch.cr().read().en() {
-            ch.fcr().write(|w| w.set_suspf(true));
-            ch.cr().modify(|w| w.set_susp(true));
-            loop {
-                let sr = ch.sr().read();
-                if sr.suspf() || sr.idlef() {
-                    break;
+        // CR.RESET is only honoured on a suspended (SUSPF) or disabled
+        // channel; IDLEF alone is not enough. SUSPF is not cleared first: a
+        // channel already suspended raises no new SUSPF, and the RESET would
+        // then be ignored. Both waits are bounded; RESET is checked and
+        // retried once.
+        fn settled(ch: pac::gpdma::Channel) -> bool {
+            for _ in 0..10_000 {
+                if ch.sr().read().suspf() || !ch.cr().read().en() {
+                    return true;
                 }
             }
+            false
         }
 
-        ch.cr().modify(|w| w.set_reset(true));
+        for _ in 0..2 {
+            if ch.cr().read().en() {
+                ch.cr().modify(|w| w.set_susp(true));
+                if !settled(ch) {
+                    // A SUSPF cleared since the channel was suspended does not
+                    // come back: resume and suspend again to raise a fresh one.
+                    ch.cr().modify(|w| w.set_susp(false));
+                    ch.cr().modify(|w| w.set_susp(true));
+                    settled(ch);
+                }
+            }
+
+            ch.cr().modify(|w| w.set_reset(true));
+            if !ch.cr().read().en() {
+                break;
+            }
+        }
     }
 
     fn is_running(&self) -> bool {
