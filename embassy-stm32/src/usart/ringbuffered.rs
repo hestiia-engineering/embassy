@@ -87,6 +87,8 @@ pub struct RingBufferedUartRx<'d> {
     diag: RxDiagCounters,
     diag_last_error: Option<RxErrorDiag>,
     diag_inject_armed: bool,
+    /// The receiver was started once (the first start needs no recovery).
+    started_once: bool,
     /// The armed injection holds the receiver stopped once it fires.
     diag_inject_hold: bool,
     /// Bench hold in force: nothing restarts the receiver until released.
@@ -149,6 +151,8 @@ pub struct RxDiagCounters {
     pub errors: [u32; RX_ERROR_SOURCES],
     /// Times a read found the receiver stopped and restarted it.
     pub auto_restarts: u32,
+    /// USART UE cycles run by the receiver recovery.
+    pub ue_cycles: u32,
 }
 
 /// Live receive-path state (register reads only). Diagnostic only.
@@ -214,6 +218,7 @@ impl<'d> UartRx<'d, Async> {
             diag: RxDiagCounters::default(),
             diag_last_error: None,
             diag_inject_armed: false,
+            started_once: false,
             diag_inject_hold: false,
             diag_hold: false,
         }
@@ -234,6 +239,7 @@ impl<'d> RingBufferedUartRx<'d> {
     /// Note: This is also done automatically by the read functions if
     /// required.
     pub fn start_uart(&mut self) {
+        self.started_once = true;
         // Clear the buffer so that it is ready to receive data
         compiler_fence(Ordering::SeqCst);
         self.ring_buf.start();
@@ -311,16 +317,49 @@ impl<'d> RingBufferedUartRx<'d> {
         }
         // Bench hold (diag_arm_inject_stop_hold): the receiver stays stopped.
         if !self.diag_hold {
-            self.start_uart();
+            self.restart_with_ue_cycle();
         }
+    }
+
+    /// Restart a receiver stopped by an error, from a clean USART: stop the
+    /// channel, wait for TX to finish (same USART; the protocol is
+    /// request/response, so this is short), cycle CR1.UE (BRR untouched),
+    /// which drops a DMA request left latched in the USART, then
+    /// `start_uart` (channel re-armed, FIFO flushed, flags cleared, DMAR,
+    /// then EIE). Seen on the bench: with the request latched, the channel
+    /// was enabled and idle and BNDT never moved; only UE = 0 freed it.
+    fn restart_with_ue_cycle(&mut self) {
+        self.stop_uart();
+        self.ring_buf.request_reset();
+        let r = self.info.regs;
+        if r.cr1().read().te() {
+            for _ in 0..200_000 {
+                if sr(r).read().tc() {
+                    break;
+                }
+            }
+        }
+        r.cr1().modify(|w| w.set_ue(false));
+        r.cr1().modify(|w| w.set_ue(true));
+        compiler_fence(Ordering::SeqCst);
+        self.diag.ue_cycles = self.diag.ue_cycles.wrapping_add(1);
+        #[cfg(gpdma)]
+        crate::dma::diag_note_ue_cycle(self.ring_buf.channel_ids().2);
+        self.start_uart();
     }
 
     /// Stop DMA backed UART receiver
     fn stop_uart(&mut self) {
-        self.ring_buf.request_pause();
-
         let r = self.info.regs;
-        // clear all interrupts and DMA Rx Request
+        // DMA requests and interrupts off FIRST, then the channel: a request
+        // raised after the channel was told to suspend could otherwise be
+        // left latched, un-acknowledged.
+        r.cr3().modify(|w| {
+            // disable Error Interrupt: (Frame error, Noise error, Overrun error)
+            w.set_eie(false);
+            // disable DMA Rx Request
+            w.set_dmar(false);
+        });
         r.cr1().modify(|w| {
             // disable RXNE interrupt
             w.set_rxneie(false);
@@ -329,12 +368,9 @@ impl<'d> RingBufferedUartRx<'d> {
             // disable idle line interrupt
             w.set_idleie(false);
         });
-        r.cr3().modify(|w| {
-            // disable Error Interrupt: (Frame error, Noise error, Overrun error)
-            w.set_eie(false);
-            // disable DMA Rx Request
-            w.set_dmar(false);
-        });
+        fence(Ordering::SeqCst);
+
+        self.ring_buf.request_pause();
 
         compiler_fence(Ordering::SeqCst);
     }
@@ -360,7 +396,11 @@ impl<'d> RingBufferedUartRx<'d> {
         // restarting, so reception never resumed.
         if !r.cr3().read().dmar() && !self.diag_hold {
             self.diag.auto_restarts = self.diag.auto_restarts.wrapping_add(1);
-            self.start_uart();
+            if self.started_once {
+                self.restart_with_ue_cycle();
+            } else {
+                self.start_uart();
+            }
         }
         res?;
         Ok(())

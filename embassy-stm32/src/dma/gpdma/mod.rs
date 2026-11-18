@@ -28,6 +28,15 @@ static DIAG_LAST_RESET_CR: [AtomicU32; super::CHANNEL_COUNT] =
     [const { AtomicU32::new(0) }; super::CHANNEL_COUNT];
 static DIAG_LAST_RESET_SR: [AtomicU32; super::CHANNEL_COUNT] =
     [const { AtomicU32::new(0) }; super::CHANNEL_COUNT];
+/// USART UE cycles of the receiver recovery, by its RX channel id.
+static DIAG_UE_CYCLES: [AtomicU32; super::CHANNEL_COUNT] =
+    [const { AtomicU32::new(0) }; super::CHANNEL_COUNT];
+
+/// Diagnostic: one UE cycle of the USART whose RX uses channel `id`.
+pub(crate) fn diag_note_ue_cycle(id: u8) {
+    let id = usize::from(id).min(super::CHANNEL_COUNT - 1);
+    DIAG_UE_CYCLES[id].fetch_add(1, Ordering::Relaxed);
+}
 
 /// Diagnostic `request_reset` record of one channel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -41,6 +50,8 @@ pub struct DiagResetCounts {
     pub last_cr: u32,
     /// CxSR read right after the last RESET write.
     pub last_sr: u32,
+    /// USART UE cycles of the receiver recovery on this RX channel.
+    pub ue_cycles: u32,
 }
 
 /// Diagnostic (bench): the `request_reset` record of channel `id` (the
@@ -52,6 +63,7 @@ pub fn diag_reset_counts(id: usize) -> DiagResetCounts {
         en_after_reset: DIAG_EN_AFTER_RESET[id].load(Ordering::Relaxed),
         last_cr: DIAG_LAST_RESET_CR[id].load(Ordering::Relaxed),
         last_sr: DIAG_LAST_RESET_SR[id].load(Ordering::Relaxed),
+        ue_cycles: DIAG_UE_CYCLES[id].load(Ordering::Relaxed),
     }
 }
 
@@ -479,31 +491,47 @@ impl<'d> Channel<'d> {
         let info = self.info();
         let ch = info.dma.ch(info.num);
 
-        // CR.RESET is ignored on an active channel: suspend for real first. A
-        // SUSPF still latched from an earlier suspend would end the wait at
-        // once, so it is cleared before asking.
-        if ch.cr().read().en() {
-            ch.fcr().write(|w| w.set_suspf(true));
-            ch.cr().modify(|w| w.set_susp(true));
-            loop {
-                let sr = ch.sr().read();
-                if sr.suspf() || sr.idlef() {
-                    break;
+        // CR.RESET only takes effect on a channel in a steady state:
+        // suspended (EN = 1 with SUSPF = 1) or disabled (EN = 0). IDLEF alone
+        // is not enough, and SUSPF must not be cleared first: on a channel
+        // already suspended no new SUSPF follows, the RESET write is then
+        // ignored and the channel stays enabled, stuck (embedded issue
+        // 1695). A suspend whose SUSPF was cleared earlier is redone (resume,
+        // suspend) to raise a fresh one. The RESET is checked and retried
+        // once.
+        fn suspended(ch: pac::gpdma::Channel) -> bool {
+            for _ in 0..10_000 {
+                if ch.sr().read().suspf() || !ch.cr().read().en() {
+                    return true;
                 }
             }
+            false
         }
-
-        ch.cr().modify(|w| w.set_reset(true));
-
-        // Diagnostic only: register reads and counters.
         let id = self.id as usize;
-        let cr = ch.cr().read();
-        DIAG_RESETS[id].fetch_add(1, Ordering::Relaxed);
-        if cr.en() {
-            DIAG_EN_AFTER_RESET[id].fetch_add(1, Ordering::Relaxed);
+        for _ in 0..2 {
+            if ch.cr().read().en() {
+                ch.cr().modify(|w| w.set_susp(true));
+                if !suspended(ch) {
+                    ch.cr().modify(|w| w.set_susp(false));
+                    ch.cr().modify(|w| w.set_susp(true));
+                    suspended(ch);
+                }
+            }
+
+            ch.cr().modify(|w| w.set_reset(true));
+
+            // Diagnostic only: register reads and counters.
+            let cr = ch.cr().read();
+            DIAG_RESETS[id].fetch_add(1, Ordering::Relaxed);
+            if cr.en() {
+                DIAG_EN_AFTER_RESET[id].fetch_add(1, Ordering::Relaxed);
+            }
+            DIAG_LAST_RESET_CR[id].store(cr.0, Ordering::Relaxed);
+            DIAG_LAST_RESET_SR[id].store(ch.sr().read().0, Ordering::Relaxed);
+            if !cr.en() {
+                break;
+            }
         }
-        DIAG_LAST_RESET_CR[id].store(cr.0, Ordering::Relaxed);
-        DIAG_LAST_RESET_SR[id].store(ch.sr().read().0, Ordering::Relaxed);
     }
 
     fn is_running(&self) -> bool {
