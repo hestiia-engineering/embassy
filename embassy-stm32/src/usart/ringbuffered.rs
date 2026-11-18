@@ -1,6 +1,6 @@
 use core::future::poll_fn;
 use core::mem;
-use core::sync::atomic::{Ordering, compiler_fence};
+use core::sync::atomic::{Ordering, compiler_fence, fence};
 use core::task::Poll;
 
 use embassy_embedded_hal::SetConfig;
@@ -247,7 +247,30 @@ impl<'d> RingBufferedUartRx<'d> {
         self.ring_buf.clear();
 
         let r = self.info.regs;
-        // clear all interrupts and DMA Rx Request
+        // Restarting after an overrun finds the RX FIFO full and ORE raised.
+        // Enabling EIE and DMAR together then lets the error interrupt
+        // (`on_interrupt`) see ORE and clear DMAR before the DMA has moved a
+        // byte, so the FIFO never drains and every restart fails the same
+        // way. Flush the FIFO and clear the stale error flags first (the up
+        // to 8 bytes dropped arrived around an overrun and are garbage
+        // anyway), make the DMA request live, and only then enable the
+        // interrupts.
+        #[cfg(any(usart_v3, usart_v4))]
+        {
+            r.rqr().write(|w| w.set_rxfrq(true));
+            r.icr().write(|w| {
+                w.set_pe(true);
+                w.set_fe(true);
+                w.set_ne(true);
+                w.set_ore(true);
+            });
+        }
+        r.cr3().modify(|w| {
+            // enable DMA Rx Request
+            w.set_dmar(true);
+        });
+        // The DMA request must be live before an error interrupt can fire.
+        fence(Ordering::SeqCst);
         r.cr1().modify(|w| {
             // use RXNE only when returning reads early
             w.set_rxneie(self.state.eager_reads.load(Ordering::Relaxed) > 0);
@@ -259,8 +282,6 @@ impl<'d> RingBufferedUartRx<'d> {
         r.cr3().modify(|w| {
             // enable Error Interrupt: (Frame error, Noise error, Overrun error)
             w.set_eie(true);
-            // enable DMA Rx Request
-            w.set_dmar(true);
         });
     }
 
