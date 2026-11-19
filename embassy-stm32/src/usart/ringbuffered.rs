@@ -239,18 +239,57 @@ impl<'d> RingBufferedUartRx<'d> {
         self.stop_uart();
         self.ring_buf.request_reset();
         let r = self.info.regs;
-        // UE = 0 would cut a frame still being sent on the same USART.
-        if r.cr1().read().te() {
-            for _ in 0..200_000 {
-                if sr(r).read().tc() {
-                    break;
-                }
-            }
-        }
+        self.wait_tx_idle();
         r.cr1().modify(|w| w.set_ue(false));
         r.cr1().modify(|w| w.set_ue(true));
         compiler_fence(Ordering::SeqCst);
         self.start_uart();
+    }
+
+    /// Let what the same USART still sends leave before UE = 0 cuts it. TC
+    /// cannot say it alone (clearing the RX flags clears it too), so the
+    /// TX queue (TDR, or the FIFO) is drained one frame time at a time,
+    /// then one more frame is left to the shift register. Bounded: at most
+    /// the queue depth plus one frame.
+    fn wait_tx_idle(&self) {
+        let r = self.info.regs;
+        if !r.cr1().read().te() || sr(r).read().tc() {
+            return;
+        }
+        let frame = self.frame_cycles();
+        // 8-deep TX FIFO plus TDR.
+        for _ in 0..9 {
+            if tx_queue_empty(r) {
+                break;
+            }
+            cortex_m::asm::delay(frame);
+        }
+        cortex_m::asm::delay(frame);
+    }
+
+    /// Core cycles a 12-bit frame takes at the current line speed, an
+    /// upper bound (8x oversampling counts as 16x).
+    fn frame_cycles(&self) -> u32 {
+        let r = self.info.regs;
+        // Kernel clocks per bit: BRR at 16x oversampling, BRR / 256 on an LPUART.
+        #[allow(unused_mut)]
+        let mut bit = u64::from(r.brr().read().0);
+        #[cfg(any(usart_v3, usart_v4))]
+        if self.info.kind == super::Kind::Lpuart {
+            bit /= 256;
+        }
+        #[cfg(usart_v4)]
+        {
+            const DIVS: [u64; 12] = [1, 2, 4, 6, 8, 10, 12, 16, 32, 64, 128, 256];
+            let presc = usize::from(r.presc().read().prescaler().to_bits());
+            bit *= DIVS[presc.min(DIVS.len() - 1)];
+        }
+        let sys = unsafe { crate::rcc::get_freqs() }
+            .sys
+            .to_hertz()
+            .map_or(0, |h| u64::from(h.0));
+        let kernel = u64::from(self.kernel_clock.0).max(1);
+        u32::try_from(bit * 12 * sys / kernel).unwrap_or(u32::MAX)
     }
 
     /// Stop DMA backed UART receiver
@@ -419,6 +458,16 @@ impl Drop for RingBufferedUartRx<'_> {
         self.stop_uart();
         super::drop_tx_rx(self.info, self.state);
     }
+}
+
+/// Nothing waits to be sent: TDR empty, or the TX FIFO when it is enabled.
+fn tx_queue_empty(r: Regs) -> bool {
+    let isr = sr(r).read();
+    #[cfg(usart_v4)]
+    if r.cr1().read().fifoen() {
+        return isr.txfe();
+    }
+    isr.txe()
 }
 
 /// Check and clear idle and error interrupts, return true if idle, Err(e) on error
