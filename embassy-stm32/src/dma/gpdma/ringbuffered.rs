@@ -121,6 +121,13 @@ impl<'a, W: Word> ReadableRingBuffer<'a, W> {
         // set back to 0: every position then reads one item (half the ring)
         // behind, for good. Suspend for real and reset first.
         self.channel.request_reset();
+        // A channel the bounded reset left enabled cannot be reprogrammed
+        // (the write would raise a user setting error, fatal in the IRQ
+        // handler). Leave it suspended: the receiver then overruns, and the
+        // restart that follows resets the channel again.
+        if self.channel.is_enabled() {
+            return;
+        }
         // Apply the default configuration to the channel.
         unsafe { self.channel.configure_linked_list(&self.table, self.options) };
         self.table.link(RunMode::Circular);

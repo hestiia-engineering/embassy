@@ -459,6 +459,11 @@ impl<'d> Channel<'d> {
         }
     }
 
+    fn is_enabled(&self) -> bool {
+        let info = self.info();
+        info.dma.ch(info.num).cr().read().en()
+    }
+
     fn is_running(&self) -> bool {
         let info = self.info();
         let ch = info.dma.ch(info.num);
